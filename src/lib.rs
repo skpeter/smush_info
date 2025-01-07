@@ -29,8 +29,8 @@ static mut OFFSET1 : usize = 0x1b52a0;
 static mut OFFSET2 : usize = 0x225dc2c;
 static mut OFFSET3 : usize = 0xd7140;
 
-// Default 13.0.2 offset
-static mut FIGHTER_SELECTED_OFFSET: usize = 0x66e140;
+// Default 13.0.3 offset
+static mut FIGHTER_SELECTED_OFFSET: usize = 0x66e160;
 
 static FIGHTER_SELECTED_SEARCH_CODE: &[u8] = &[
     0xb0, 0xde, 0x45, 0x94,
@@ -192,7 +192,7 @@ fn start_server() -> Result<(), i64> {
                     println!("send_bytes errno = {}", e);
                 }
             }
-            std::thread::sleep(Duration::from_millis(160));
+            std::thread::sleep(Duration::from_millis(500));
         }
         /*let magic = recv_bytes(tcp_socket, 4).unwrap();
         if &magic == b"HRLD" {
@@ -401,7 +401,7 @@ fn nro_main(nro: &skyline::nro::NroInfo<'_>) {
 }
 
 
-static UPDATE_TAG_FOR_PLAYER_OFFSET: usize = 0x19fd090;
+static UPDATE_TAG_FOR_PLAYER_OFFSET: usize = 0x19fd0b0;
 static PLAYER_SAVE_OFFSET: usize = 0x5314510;
 static mut PLAYER_SAVE_ADDRESS: *const u64 = 0x0 as *const u64;
 
@@ -522,7 +522,7 @@ fn search_offsets() {
     }
 }
 
-#[skyline::hook(offset = 0x2335164, inline)]
+#[skyline::hook(offset = 0x2335184, inline)]
 unsafe fn selected_stage(ctx: &InlineCtx) {
     println!("stage has been selected");
     GAME_INFO.is_results_screen.store(false, Ordering::SeqCst);
