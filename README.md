@@ -10,6 +10,14 @@ Original Authors:
 
 Seems jam1garner has left the scene so I don't feel particularly comfortable asking them licensing questions, but consider everything I've added to this project GPLv3
 
+# Requirements
+smush_info requires you to have the following Skyline plugins downloaded and installed:
+- [Arcropolis](https://github.com/Raytwo/ARCropolis/releases)
+- [libacmd_hook](https://github.com/ultimate-research/acmd_hook/releases)
+- [libnn_hid_hook](https://github.com/jugeeya/nn-hid-hook)
+- [libnro_hook](https://github.com/ultimate-research/nro-hook-plugin/releases)
+- [Smashline V1](https://github.com/blu-dev/smashline_hook/releases)
+
 # How to Build and Install
 You must have Rust and Cargo installed. [Click here](https://www.rust-lang.org/tools/install) for instructions on how to install based on your system.
 
