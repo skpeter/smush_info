@@ -14,7 +14,7 @@ Seems jam1garner has left the scene so I don't feel particularly comfortable ask
 smush_info requires you to have the following Skyline plugins downloaded and installed:
 - [Arcropolis](https://github.com/Raytwo/ARCropolis/releases)
 - [libacmd_hook](https://github.com/ultimate-research/acmd_hook/releases)
-- [libnn_hid_hook](https://github.com/jugeeya/nn-hid-hook)
+- [libnn_hid_hook](https://github.com/jugeeya/nn-hid-hook/releases/tag/beta)
 - [libnro_hook](https://github.com/ultimate-research/nro-hook-plugin/releases)
 - [Smashline V1](https://github.com/blu-dev/smashline_hook/releases)
 
