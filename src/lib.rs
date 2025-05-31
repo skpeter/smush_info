@@ -7,6 +7,7 @@ use skyline::libc::*;
 use std::time::Duration;
 use std::mem::size_of_val;
 use std::sync::atomic::Ordering;
+use std::panic;
 
 use smash::app;
 use smash::app::lua_bind;
@@ -24,6 +25,7 @@ use smash::Vector2f;
 
 mod conversions;
 use conversions::{kind_to_char, stage_id_to_stage};
+mod mdns;
 
 static mut OFFSET1 : usize = 0x1b52a0;
 static mut OFFSET2 : usize = 0x225dc2c;
@@ -628,6 +630,17 @@ pub fn main() {
             if let Err(98) = start_server() {
                 break
             }
+        }
+    });
+    std::thread::spawn(|| {
+        loop {
+            let result = panic::catch_unwind(|| {
+                mdns::broadcast_mdns_response(6500);
+            });
+            if let Err(err) = result {
+                println!("[mDNS] Broadcast thread panicked!");
+            }
+            std::thread::sleep(std::time::Duration::from_secs(1));
         }
     });
 }
