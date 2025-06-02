@@ -22,7 +22,7 @@ use smash::Vector2f;
 
 mod conversions;
 use conversions::{kind_to_char, stage_id_to_stage};
-mod mdns;
+mod udp;
 
 static mut OFFSET1 : usize = 0x1b52a0;
 static mut OFFSET2 : usize = 0x225dc2c;
@@ -642,7 +642,7 @@ pub fn main() {
         println!("[smush_info] starting broadcast");
         loop {
             std::thread::sleep(std::time::Duration::from_secs(2));
-            mdns::broadcast_device_info();
+            udp::broadcast_device_info();
         }
             
     });
