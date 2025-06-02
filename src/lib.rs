@@ -7,19 +7,16 @@ use skyline::libc::*;
 use std::time::Duration;
 use std::mem::size_of_val;
 use std::sync::atomic::Ordering;
-use std::panic;
 
 use smash::app;
 use smash::app::lua_bind;
 use smash::app::lua_bind::*;
 use smash::lib::lua_const::*;
-use smash::app::BattleObject;
 use smash::lua2cpp::{L2CFighterCommon, L2CFighterCommon_status_pre_Rebirth, L2CFighterCommon_status_pre_Entry, L2CFighterCommon_sub_damage_uniq_process_init, L2CFighterCommon_status_pre_Dead};
 use smash::lib::L2CValue;
 
 use smush_info_shared::Info;
 
-use core::arch::aarch64::*;
 use smash::Vector3f;
 use smash::Vector2f;
 
@@ -40,6 +37,13 @@ static FIGHTER_SELECTED_SEARCH_CODE: &[u8] = &[
     0xe1, 0x03, 0x1a, 0x32,
 ];
 
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct Float32x2 {
+    pub x: f32,
+    pub y: f32,
+}
+
 extern "C" {
     #[link_name = "\u{1}_ZN3app7utility8get_kindEPKNS_26BattleObjectModuleAccessorE"]
     pub fn get_kind(module_accessor: &mut app::BattleObjectModuleAccessor) -> i32;
@@ -51,7 +55,7 @@ extern "C" {
     pub fn get_remaining_time_as_frame() -> u32;
     
     #[link_name = "\u{1}_ZN3app17sv_camera_manager15world_to_screenERKN3phx8Vector3fEb"]
-    pub fn world_to_screen(vec: *const Vector3f, unk: bool) -> float32x2_t;
+    pub fn world_to_screen(vec: *const Vector3f, unk: bool) -> Float32x2;
 }
 
 fn send_bytes(socket: i32, bytes: &[u8]) -> Result<(), i64> {
@@ -66,11 +70,9 @@ fn send_bytes(socket: i32, bytes: &[u8]) -> Result<(), i64> {
 }
 
 fn as_pixels(vec: Vector3f) -> Vector2f {
-    unsafe {        
+    unsafe {
         let screen = world_to_screen(&vec, true);
-        let x = vget_lane_f32(screen, 0);
-        let y = vget_lane_f32(screen, 1);
-        return Vector2f{x, y};
+        Vector2f { x: screen.x, y: screen.y }
     }
 }
 
@@ -175,7 +177,7 @@ fn start_server() -> Result<(), i64> {
             }
 
             GAME_INFO.current_menu.store(*(offset_to_addr(0x53050f0) as *const u32), Ordering::SeqCst);
-            if(FighterManager::entry_count(mgr) > 0 && *(offset_to_addr(0x53050f0) as *const u32) != 0x6020000) {
+            if FighterManager::entry_count(mgr) > 0 && *(offset_to_addr(0x53050f0) as *const u32) != 0x6020000 {
                 GAME_INFO.is_results_screen.store(FighterManager::is_result_mode(mgr), Ordering::SeqCst);
             }
 
@@ -326,7 +328,7 @@ pub unsafe fn set_player_information(module_accessor: &mut app::BattleObjectModu
     let is_cpu = FighterInformation::is_operation_cpu(fighter_information);
     let skin = (WorkModule::get_int(module_accessor, *FIGHTER_INSTANCE_WORK_ID_INT_COLOR)) as u32; //returns costume slot 0-indexed
 
-    if(FighterManager::entry_count(mgr) > 0) {
+    if FighterManager::entry_count(mgr) > 0 {
         GAME_INFO.players[player_num].hero_menu_selected.store(false, Ordering::SeqCst);
         GAME_INFO.players[player_num].hero_menu_open.store(false, Ordering::SeqCst);            
     }
@@ -448,11 +450,13 @@ pub fn update_tag_for_player(param_1: u64, tag_index: *const u8){
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 struct UnkPtr1 {
     ptrs: [&'static u64; 7],
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 struct UnkPtr2 {
     bunch_bytes: [u8; 0x20],
     bunch_bytes2: [u8; 0x20]
@@ -525,7 +529,7 @@ fn search_offsets() {
 }
 
 #[skyline::hook(offset = 0x2335184, inline)]
-unsafe fn selected_stage(ctx: &InlineCtx) {
+unsafe fn selected_stage(_ctx: &InlineCtx) {
     println!("stage has been selected");
     GAME_INFO.is_results_screen.store(false, Ordering::SeqCst);
 }
@@ -595,7 +599,7 @@ pub fn main() {
     unsafe {
         PLAYER_SAVE_ADDRESS = offset_to_addr(PLAYER_SAVE_OFFSET) as *const u64;
         skyline::nn::ro::LookupSymbol(
-            &mut FIGHTER_MANAGER_ADDR,
+            &raw mut FIGHTER_MANAGER_ADDR,
             "_ZN3lib9SingletonIN3app14FighterManagerEE9instance_E\u{0}".as_bytes().as_ptr(),
         );
         let text_ptr = getRegionAddress(Region::Text) as *const u8;
@@ -626,21 +630,21 @@ pub fn main() {
 
     std::thread::spawn(||{
         loop {
-            std::thread::sleep(std::time::Duration::from_secs(5));
+            std::thread::sleep(std::time::Duration::from_secs(30));
+            println!("[smush_info] starting tcp server");
             if let Err(98) = start_server() {
                 break
             }
         }
     });
-    std::thread::spawn(|| {
+    std::thread::spawn(||{
+        std::thread::sleep(std::time::Duration::from_secs(5));
+        println!("[smush_info] starting broadcast");
         loop {
-            let result = panic::catch_unwind(|| {
-                mdns::broadcast_mdns_response(6500);
-            });
-            if let Err(err) = result {
-                println!("[mDNS] Broadcast thread panicked!");
-            }
-            std::thread::sleep(std::time::Duration::from_secs(1));
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            mdns::broadcast_device_info();
         }
+            
     });
+
 }
