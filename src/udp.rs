@@ -94,7 +94,7 @@ pub fn broadcast_device_info() {
             None => return,
         };
 
-        let message = format!("{} ({})", username, ip);
+        let message = format!("smush_info:{}:{}", username, ip);
         let message_bytes = message.as_bytes();
 
         let ip_octets = ip.octets();
