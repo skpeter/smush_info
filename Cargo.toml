@@ -13,6 +13,7 @@ crate-type = ["cdylib"]
 [dependencies]
 skyline = { git = "https://github.com/ultimate-research/skyline-rs.git" }
 skyline_smash = { git = "https://github.com/ultimate-research/skyline-smash.git" }
+nnsdk = { git = "https://github.com/ultimate-research/nnsdk-rs" }
 smush_info_shared = {  path = "smush_info_shared"}
 serde_json = "1"
 lazy_static = "1.4"
