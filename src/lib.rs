@@ -4,13 +4,9 @@
 use skyline::hooks::{getRegionAddress, Region, InlineCtx};
 use skyline::from_c_str;
 use skyline::libc::*;
-use skyline::libc;
-use std::fs::OpenOptions;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use std::mem::size_of_val;
-use libc::{fcntl, F_GETFL, F_SETFL, O_NONBLOCK};
-use std::convert::TryInto;
+use std::sync::atomic::Ordering;
 
 use smash::app;
 use smash::app::lua_bind;
@@ -28,16 +24,12 @@ mod conversions;
 use conversions::{kind_to_char, stage_id_to_stage};
 mod udp;
 
-static LAST_HEARTBEAT: AtomicU64 = AtomicU64::new(0);
 static mut OFFSET1 : usize = 0x1b52a0;
 static mut OFFSET2 : usize = 0x225dc2c;
 static mut OFFSET3 : usize = 0xd7140;
 
 // Default 13.0.3 offset
 static mut FIGHTER_SELECTED_OFFSET: usize = 0x66e160;
-
-const EAGAIN: i64 = 11;
-const EWOULDBLOCK: i64 = 11;
 
 static FIGHTER_SELECTED_SEARCH_CODE: &[u8] = &[
     0xb0, 0xde, 0x45, 0x94,
@@ -50,14 +42,6 @@ static FIGHTER_SELECTED_SEARCH_CODE: &[u8] = &[
 pub struct Float32x2 {
     pub x: f32,
     pub y: f32,
-}
-
-fn update_heartbeat() {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    LAST_HEARTBEAT.store(now, Ordering::Relaxed);
 }
 
 extern "C" {
@@ -74,11 +58,11 @@ extern "C" {
     pub fn world_to_screen(vec: *const Vector3f, unk: bool) -> Float32x2;
 }
 
-fn send_bytes(socket: i32, bytes: &[u8]) -> Result<(), i32> {
+fn send_bytes(socket: i32, bytes: &[u8]) -> Result<(), i64> {
     unsafe {
         let ret = send(socket, bytes.as_ptr() as *const _, bytes.len(), 0);
         if ret < 0 {
-            return Err((*errno_loc()).try_into().unwrap());
+            Err(*errno_loc())
         } else {
             Ok(())
         }
@@ -102,10 +86,10 @@ pub fn once_per_frame_per_fighter(fighter : &mut L2CFighterCommon) {
         let pos_x = lua_bind::PostureModule::pos_x(module_accessor);
         let pos_y = lua_bind::PostureModule::pos_y(module_accessor);
         let pos_z = lua_bind::PostureModule::pos_z(module_accessor);
-        // log!("player {} x {} y {} z {}", player_num, pos_x, pos_y, pos_z);
+        // println!("player {} x {} y {} z {}", player_num, pos_x, pos_y, pos_z);
         let pos = Vector3f { x: pos_x, y: pos_y, z: pos_z };
         let screen_pos = as_pixels(pos);
-        // log!("player {} screen_pos x {} screen_pos y {}", player_num, screen_pos.x, screen_pos.y);
+        // println!("player {} screen_pos x {} screen_pos y {}", player_num, screen_pos.x, screen_pos.y);
     
         GAME_INFO.players[player_num].x.store(screen_pos.x, Ordering::SeqCst);
         GAME_INFO.players[player_num].y.store(screen_pos.y, Ordering::SeqCst);
@@ -115,48 +99,6 @@ pub fn once_per_frame_per_fighter(fighter : &mut L2CFighterCommon) {
 
 
 static GAME_INFO: Info = Info::new();
-
-
-fn log_to_file(message: &str) {
-    if let Ok(mut file) = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("sd:/skyline_plugin_log.txt")
-    {
-        use std::io::Write;
-        let _ = writeln!(file, "{}", message);
-    }
-}
-macro_rules! log {
-    ($($arg:tt)*) => {
-        log_to_file(&format!($($arg)*));
-    }
-}
-
-macro_rules! safe_close {
-    ($fd:expr) => {
-        if $fd >= 0 {
-            let _ = close($fd);
-        }
-    };
-}
-
-extern "C" {
-    fn svcGetSystemTick() -> u64;
-}
-
-fn set_nonblocking(fd: i32) -> Result<(), i32> {
-    unsafe {
-        let flags = fcntl(fd, F_GETFL);
-        if flags < 0 {
-            return Err((*errno_loc()).try_into().unwrap());
-        }
-        if fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0 {
-            return Err((*errno_loc()).try_into().unwrap());
-        }
-    }
-    Ok(())
-}
 
 #[allow(unreachable_code)]
 fn start_server() -> Result<(), i64> {
@@ -397,13 +339,12 @@ pub unsafe fn set_player_information(module_accessor: &mut app::BattleObjectModu
     GAME_INFO.players[player_num].self_destructs.store(sd_count, Ordering::SeqCst);
     GAME_INFO.players[player_num].is_cpu.store(is_cpu, Ordering::SeqCst);
     GAME_INFO.players[player_num].skin.store(skin, Ordering::SeqCst);
-    log!("ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ player tag {}", get_tag_of_player(player_num));
+    println!("ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ player tag {}", get_tag_of_player(player_num));
     GAME_INFO.players[player_num].name.store_str(Some(&get_tag_of_player(player_num)), Ordering::SeqCst);
 }
 
 #[skyline::hook(replace = L2CFighterCommon_status_pre_Entry)]
 pub unsafe fn handle_pre_entry(fighter: &mut L2CFighterCommon) -> L2CValue {
-    check_and_restart_threads_if_needed();
     let module_accessor = app::sv_system::battle_object_module_accessor(fighter.lua_state_agent);
     set_player_information(module_accessor);
 
@@ -414,7 +355,6 @@ pub unsafe fn handle_pre_entry(fighter: &mut L2CFighterCommon) -> L2CValue {
 
 #[skyline::hook(replace = L2CFighterCommon_status_pre_Rebirth)]
 pub unsafe fn handle_pre_rebirth(fighter: &mut L2CFighterCommon) -> L2CValue {
-    check_and_restart_threads_if_needed();
     let module_accessor = app::sv_system::battle_object_module_accessor(fighter.lua_state_agent);
     set_player_information(module_accessor);
 
@@ -423,7 +363,6 @@ pub unsafe fn handle_pre_rebirth(fighter: &mut L2CFighterCommon) -> L2CValue {
 
 #[skyline::hook(replace = L2CFighterCommon_status_pre_Dead)]
 pub unsafe fn handle_pre_dead(fighter: &mut L2CFighterCommon) -> L2CValue { // this kinda fucking sucks but whatever
-    check_and_restart_threads_if_needed();
     let module_accessor = app::sv_system::battle_object_module_accessor(fighter.lua_state_agent);
 
     let entry_id = WorkModule::get_int(module_accessor, *FIGHTER_INSTANCE_WORK_ID_INT_ENTRY_ID) as i32;
@@ -437,7 +376,7 @@ pub unsafe fn handle_pre_dead(fighter: &mut L2CFighterCommon) -> L2CValue { // t
     let stock_count = (FighterInformation::stock_count(fighter_information) as u32) - 1;
     GAME_INFO.players[player_num].stocks.store(stock_count, Ordering::SeqCst);
 
-    log!("ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ WE CALLED L2CFighterCommon_status_pre_Dead AND ATTEMPTED TO SET STOCK COUNT TO {}", stock_count);
+    println!("ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ WE CALLED L2CFighterCommon_status_pre_Dead AND ATTEMPTED TO SET STOCK COUNT TO {}", stock_count);
     // set_player_information(module_accessor);
 
     original!()(fighter)
@@ -445,7 +384,6 @@ pub unsafe fn handle_pre_dead(fighter: &mut L2CFighterCommon) -> L2CValue { // t
 
 #[skyline::hook(replace = L2CFighterCommon_sub_damage_uniq_process_init)]
 pub unsafe fn handle_sub_damage_uniq_process_init(fighter: &mut L2CFighterCommon) -> L2CValue {
-    check_and_restart_threads_if_needed();
     let module_accessor = app::sv_system::battle_object_module_accessor(fighter.lua_state_agent);
     set_player_information(module_accessor);
 
@@ -502,12 +440,11 @@ pub fn get_tag_from_save(tag_index: u8) -> String {
 
 #[skyline::hook(offset = UPDATE_TAG_FOR_PLAYER_OFFSET)]
 pub fn update_tag_for_player(param_1: u64, tag_index: *const u8){
-    check_and_restart_threads_if_needed();
     unsafe {
         let player_index = *((param_1 as *mut u8).offset(0x1d4) as *mut i32) as usize;
         GAME_INFO.players[player_index].name.store_str(Some(&get_tag_from_save(*tag_index)), Ordering::SeqCst);
         
-        log!("AAAAAAAAAAAAAAAAAAAA PLAYER NAME OF INDEX {} IS {}", player_index, get_tag_from_save(*tag_index));
+        println!("AAAAAAAAAAAAAAAAAAAA PLAYER NAME OF INDEX {} IS {}", player_index, get_tag_from_save(*tag_index));
         call_original!(param_1, tag_index);
     }
 }
@@ -566,14 +503,13 @@ pub struct FighterInfoBasic {
 
 #[skyline::hook(offset = FIGHTER_SELECTED_OFFSET, inline)]
 fn css_fighter_selected(ctx: &InlineCtx) {
-    check_and_restart_threads_if_needed();
     let infos = unsafe { &*(ctx.registers[0].bindgen_union_field as *const FighterInfo) };
     let infosbasic = unsafe { &*(ctx.registers[0].bindgen_union_field as *const FighterInfoBasic) };
     let fighter_id = infos.fighter_id as i32;
     let skin = infos.fighter_slot as u32;
     let character = kind_to_char(fighter_id) as u32;
     let port = (infosbasic.field77_0x78 & 0xFFFF) as usize;
-    log!("character {}\nskin {}\nport {}\n ", character, skin, port);
+    println!("character {}\nskin {}\nport {}\n ", character, skin, port);
     GAME_INFO.players[port].character.store(character, Ordering::SeqCst);
     GAME_INFO.players[port].skin.store(skin, Ordering::SeqCst);
 }
@@ -587,15 +523,14 @@ fn search_offsets() {
         if let Some(offset) = find_subsequence(text, FIGHTER_SELECTED_SEARCH_CODE) {
             FIGHTER_SELECTED_OFFSET = offset;
         } else {
-            log!("Error: no offset found for 'css_fighter_selected'. Defaulting to 13.0.2 offset. This likely won't work.");
+            println!("Error: no offset found for 'css_fighter_selected'. Defaulting to 13.0.2 offset. This likely won't work.");
         }
     }
 }
 
 #[skyline::hook(offset = 0x2335184, inline)]
 unsafe fn selected_stage(_ctx: &InlineCtx) {
-    check_and_restart_threads_if_needed();
-    log!("stage has been selected");
+    println!("stage has been selected");
     GAME_INFO.is_results_screen.store(false, Ordering::SeqCst);
 }
 
@@ -657,43 +592,6 @@ pub unsafe fn special_lw_close_window_hook(fighter: &mut app::Fighter, arg2: boo
     call_original!(fighter, arg2, no_decide, arg4);
 }
 
-fn check_and_restart_threads_if_needed() {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    let last = LAST_HEARTBEAT.load(Ordering::Relaxed);
-
-    if now - last > 10 {
-
-        log!("Restarting network threads...");
-        start_network_threads(true);
-    }
-}
-
-fn start_network_threads(skip_delay: bool) {
-    std::thread::spawn(move || {
-        if !skip_delay { std::thread::sleep(std::time::Duration::from_secs(30)); }
-        loop {
-            update_heartbeat();
-            log!("[smush_info] starting tcp server");
-            if let Err(98) = start_server() {
-                break;
-            }
-        }
-    });
-
-    std::thread::spawn(move || {
-        if !skip_delay { std::thread::sleep(std::time::Duration::from_secs(5)); }
-        log!("[smush_info] starting broadcast");
-        loop {
-            update_heartbeat();
-            std::thread::sleep(std::time::Duration::from_secs(1));
-            udp::broadcast_device_info();
-        }
-    });
-}
-
 #[skyline::main(name = "discord_server")]
 pub fn main() {
     search_offsets();
@@ -729,6 +627,24 @@ pub fn main() {
         special_lw_select_index_hook
     );
     acmd::add_custom_hooks!(once_per_frame_per_fighter);
-    start_network_threads(false);
-    
+
+    std::thread::spawn(||{
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(30));
+            println!("[smush_info] starting tcp server");
+            if let Err(98) = start_server() {
+                break
+            }
+        }
+    });
+    std::thread::spawn(||{
+        std::thread::sleep(std::time::Duration::from_secs(5));
+        println!("[smush_info] starting broadcast");
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            udp::broadcast_device_info();
+        }
+            
+    });
+
 }
