@@ -2,6 +2,7 @@ use skyline::libc::{socket, setsockopt, sendto, sockaddr_in, in_addr, AF_INET, S
 use core::mem;
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicI32, Ordering};
+use skyline::libc::close;
 
 static BROADCAST_SOCKET: AtomicI32 = AtomicI32::new(-1);
 const BROADCAST_PORT: u16 = 6500;
@@ -129,6 +130,14 @@ pub fn broadcast_device_info() {
                 "[smush_info] Failed to send UDP packet: sendto returned {}, errno = {}, {}",
                 sent, errno_val, err_msg
             );
+
+            // Invalidate socket so next call recreates it
+            let sock_fd = BROADCAST_SOCKET.swap(-1, Ordering::Relaxed);
+            if sock_fd >= 0 {
+                close(sock_fd);
+                println!("[smush_info] Socket closed and will be recreated on next broadcast");
+            }
         }
+
     }
 }
