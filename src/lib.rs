@@ -504,8 +504,8 @@ pub struct FighterInfoBasic {
 
 #[skyline::hook(offset = FIGHTER_SELECTED_OFFSET, inline)]
 fn css_fighter_selected(ctx: &InlineCtx) {
-    let infos = unsafe { &*(ctx.registers[0].bindgen_union_field as *const FighterInfo) };
-    let infosbasic = unsafe { &*(ctx.registers[0].bindgen_union_field as *const FighterInfoBasic) };
+    let infos = unsafe { &*(ctx.registers[0].x() as *const FighterInfo) };
+    let infosbasic = unsafe { &*(ctx.registers[0].x() as *const FighterInfoBasic) };
     let fighter_id = infos.fighter_id as i32;
     let skin = infos.fighter_slot as u32;
     let character = kind_to_char(fighter_id) as u32;
