@@ -1,0 +1,1 @@
+smush_info:RyuPlayer:192.168.18.64
