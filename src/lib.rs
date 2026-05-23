@@ -222,11 +222,22 @@ fn start_server() -> Result<(), i64> {
 
 
         loop {
-            let mgr = *(FIGHTER_MANAGER_ADDR as *mut *mut app::FighterManager);
-            let is_match = FighterManager::entry_count(mgr) > 0 &&
-                !FighterManager::is_result_mode(mgr) &&
-                *(offset_to_addr(0x53040f0) as *const u32) != 0x6020000 && //is_match is set to true when the player in the controls screen, i assume because there is a sandbag and mario. this ensures we're not in the controls screen 
-                *(offset_to_addr(0x53040f0) as *const u32) != 0x4050000; //performs same check to make sure we're not on mii maker
+            // FighterManager singleton may not exist yet (early in app boot, before title screen)
+            // and FIGHTER_MANAGER_ADDR can be 0 if LookupSymbol failed. Treat both as "no match"
+            // to avoid dereferencing a null this-pointer in entry_count/is_result_mode.
+            let mgr: *mut app::FighterManager = if FIGHTER_MANAGER_ADDR == 0 {
+                std::ptr::null_mut()
+            } else {
+                *(FIGHTER_MANAGER_ADDR as *mut *mut app::FighterManager)
+            };
+            let current_menu: u32 = *(offset_to_addr(0x53040f0) as *const u32);
+            const CONTROLS_SCREEN_MENU: u32 = 0x6020000;
+            const MII_MAKER_MENU: u32 = 0x4050000;
+            let menu_is_gameplay = current_menu != CONTROLS_SCREEN_MENU && current_menu != MII_MAKER_MENU;
+            let is_match = !mgr.is_null()
+                && FighterManager::entry_count(mgr) > 0
+                && !FighterManager::is_result_mode(mgr)
+                && menu_is_gameplay;
 
             if is_match {
                 GAME_INFO.remaining_frames.store(get_remaining_time_as_frame(), Ordering::SeqCst);
@@ -239,8 +250,8 @@ fn start_server() -> Result<(), i64> {
                 }
             }
 
-            GAME_INFO.current_menu.store(*(offset_to_addr(0x53040f0) as *const u32), Ordering::SeqCst);
-            if FighterManager::entry_count(mgr) > 0 && *(offset_to_addr(0x53040f0) as *const u32) != 0x6020000 && *(offset_to_addr(0x53040f0) as *const u32) != 0x4050000 {
+            GAME_INFO.current_menu.store(current_menu, Ordering::SeqCst);
+            if !mgr.is_null() && FighterManager::entry_count(mgr) > 0 && menu_is_gameplay {
                 GAME_INFO.is_results_screen.store(FighterManager::is_result_mode(mgr), Ordering::SeqCst);
             }
 
