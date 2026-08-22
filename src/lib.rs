@@ -231,8 +231,8 @@ fn start_server() -> Result<(), i64> {
                 *(FIGHTER_MANAGER_ADDR as *mut *mut app::FighterManager)
             };
             let current_menu: u32 = *(offset_to_addr(0x53040f0) as *const u32);
-            const CONTROLS_SCREEN_MENU: u32 = 0x6020000;
-            const MII_MAKER_MENU: u32 = 0x4050000;
+            const CONTROLS_SCREEN_MENU: u32 = 0x6020000; //is_match is set to true when the player in the controls screen, i assume because there is a sandbag and mario. this ensures we're not in the controls screen
+            const MII_MAKER_MENU: u32 = 0x4050000; //performs same check to make sure we're not on mii maker
             let menu_is_gameplay = current_menu != CONTROLS_SCREEN_MENU && current_menu != MII_MAKER_MENU;
             let is_match = !mgr.is_null()
                 && FighterManager::entry_count(mgr) > 0
