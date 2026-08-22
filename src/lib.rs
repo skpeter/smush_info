@@ -247,6 +247,7 @@ fn start_server() -> Result<(), i64> {
                 GAME_INFO.is_match.store(false, Ordering::SeqCst);
                 for player in &GAME_INFO.players {
                     player.is_in_game.store(false, Ordering::SeqCst);
+                    player.team.store(-1, Ordering::SeqCst);
                 }
             }
 
@@ -415,6 +416,7 @@ pub unsafe fn set_player_information(module_accessor: &mut app::BattleObjectModu
     let sd_count = FighterInformation::suicide_count(fighter_information, 0) as u32;
     let is_cpu = FighterInformation::is_operation_cpu(fighter_information);
     let skin = (WorkModule::get_int(module_accessor, *FIGHTER_INSTANCE_WORK_ID_INT_COLOR)) as u32; //returns costume slot 0-indexed
+    let team = TeamModule::team_no(module_accessor) as i32;
 
     if FighterManager::entry_count(mgr) > 0 {
         GAME_INFO.players[player_num].hero_menu_selected.store(false, Ordering::SeqCst);
@@ -427,6 +429,7 @@ pub unsafe fn set_player_information(module_accessor: &mut app::BattleObjectModu
     GAME_INFO.players[player_num].self_destructs.store(sd_count, Ordering::SeqCst);
     GAME_INFO.players[player_num].is_cpu.store(is_cpu, Ordering::SeqCst);
     GAME_INFO.players[player_num].skin.store(skin, Ordering::SeqCst);
+    GAME_INFO.players[player_num].team.store(team, Ordering::SeqCst);
     println!("ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ player tag {}", get_tag_of_player(player_num));
     GAME_INFO.players[player_num].name.store_str(Some(&get_tag_of_player(player_num)), Ordering::SeqCst);
 }
