@@ -9,7 +9,6 @@ use std::mem::size_of_val;
 use std::sync::atomic::Ordering;
 
 use smash::app;
-use smash::app::lua_bind;
 use smash::app::lua_bind::*;
 use smash::lib::lua_const::*;
 use smash::lua2cpp::{L2CFighterCommon, L2CFighterCommon_status_pre_Rebirth, L2CFighterCommon_status_pre_Entry, L2CFighterCommon_sub_damage_uniq_process_init, L2CFighterCommon_status_pre_Dead};
@@ -19,6 +18,8 @@ use smush_info_shared::Info;
 
 use smash::Vector3f;
 use smash::Vector2f;
+
+use smashline::{Agent, L2CFighterCommon as SmashlineFighterCommon, Main};
 
 mod conversions;
 use conversions::{kind_to_char, stage_id_to_stage};
@@ -131,25 +132,31 @@ fn as_pixels(vec: Vector3f) -> Vector2f {
     }
 }
 
-pub fn once_per_frame_per_fighter(fighter : &mut L2CFighterCommon) {
-    let lua_state = fighter.lua_state_agent;
-    let module_accessor = unsafe { app::sv_system::battle_object_module_accessor(lua_state) };
-    
-    unsafe {
-        let entry_id = WorkModule::get_int(module_accessor, *FIGHTER_INSTANCE_WORK_ID_INT_ENTRY_ID) as i32;
-        let player_num = entry_id as usize;
-        let pos_x = lua_bind::PostureModule::pos_x(module_accessor);
-        let pos_y = lua_bind::PostureModule::pos_y(module_accessor);
-        let pos_z = lua_bind::PostureModule::pos_z(module_accessor);
-        // println!("player {} x {} y {} z {}", player_num, pos_x, pos_y, pos_z);
-        let pos = Vector3f { x: pos_x, y: pos_y, z: pos_z };
-        let screen_pos = as_pixels(pos);
-        // println!("player {} screen_pos x {} screen_pos y {}", player_num, screen_pos.x, screen_pos.y);
-    
-        GAME_INFO.players[player_num].x.store(screen_pos.x, Ordering::SeqCst);
-        GAME_INFO.players[player_num].y.store(screen_pos.y, Ordering::SeqCst);
+unsafe extern "C" fn once_per_frame_per_fighter(fighter: &mut SmashlineFighterCommon) {
+    let module_accessor = fighter.module_accessor;
+    let entry_id =
+        WorkModule::get_int(module_accessor, *FIGHTER_INSTANCE_WORK_ID_INT_ENTRY_ID) as i32;
+    let player_num = entry_id as usize;
+    if player_num >= GAME_INFO.players.len() {
+        return;
     }
+    let pos_x = PostureModule::pos_x(module_accessor);
+    let pos_y = PostureModule::pos_y(module_accessor);
+    let pos_z = PostureModule::pos_z(module_accessor);
+    let pos = Vector3f {
+        x: pos_x,
+        y: pos_y,
+        z: pos_z,
+    };
+    let screen_pos = as_pixels(pos);
+    GAME_INFO.players[player_num].x.store(screen_pos.x, Ordering::SeqCst);
+    GAME_INFO.players[player_num].y.store(screen_pos.y, Ordering::SeqCst);
+}
 
+fn install_fighter_frame_hook() {
+    Agent::new("fighter")
+        .on_line(Main, once_per_frame_per_fighter)
+        .install();
 }
 
 
@@ -745,7 +752,7 @@ pub fn main() {
         special_lw_decide_command_hook,
         special_lw_select_index_hook
     );
-    acmd::add_custom_hooks!(once_per_frame_per_fighter);
+    install_fighter_frame_hook();
 
     std::thread::spawn(server_supervisor);
 
