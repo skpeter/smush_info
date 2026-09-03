@@ -4,7 +4,7 @@
 use skyline::hooks::{getRegionAddress, Region, InlineCtx};
 use skyline::from_c_str;
 use skyline::libc::*;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::mem::size_of_val;
 use std::sync::atomic::Ordering;
 
@@ -14,7 +14,7 @@ use smash::lib::lua_const::*;
 use smash::lua2cpp::{L2CFighterCommon, L2CFighterCommon_status_pre_Rebirth, L2CFighterCommon_status_pre_Entry, L2CFighterCommon_sub_damage_uniq_process_init, L2CFighterCommon_status_pre_Dead};
 use smash::lib::L2CValue;
 
-use smush_info_shared::Info;
+use smush_info_shared::{Character, Info};
 
 use smash::Vector3f;
 use smash::Vector2f;
@@ -23,6 +23,7 @@ use smashline::{Agent, L2CFighterCommon as SmashlineFighterCommon, Main};
 
 mod conversions;
 use conversions::{kind_to_char, stage_id_to_stage};
+mod results_log;
 mod udp;
 
 static mut OFFSET1 : usize = 0x1b52a0;
@@ -162,6 +163,172 @@ fn install_fighter_frame_hook() {
 
 static GAME_INFO: Info = Info::new();
 
+const SNAPSHOT_COOLDOWN: Duration = Duration::from_secs(120);
+
+struct PlayerSnap {
+    stocks: u32,
+    damage: f32,
+    character: u32,
+}
+
+fn collect_players(filter_invalid: bool) -> Vec<PlayerSnap> {
+    GAME_INFO
+        .players
+        .iter()
+        .filter_map(|p| {
+            let snap = PlayerSnap {
+                stocks: p.stocks.load(Ordering::SeqCst),
+                damage: p.damage.load(Ordering::SeqCst),
+                character: p.character.load(Ordering::SeqCst),
+            };
+            if filter_invalid {
+                let in_game = p.is_in_game.load(Ordering::SeqCst);
+                let cpu = p.is_cpu.load(Ordering::SeqCst);
+                if in_game || cpu {
+                    Some(snap)
+                } else {
+                    None
+                }
+            } else {
+                Some(snap)
+            }
+        })
+        .collect()
+}
+
+fn is_ice_climbers(character: u32) -> bool {
+    character == Character::Nana as u32 || character == Character::Popo as u32
+}
+
+/// Port of reframed2startgg `hasSinglesOrDoublesWinner` (winner presence only).
+fn has_singles_or_doubles_winner(players: &[PlayerSnap], remaining_frames: u32) -> bool {
+    let player_count = players.len();
+    let winners: Vec<usize> = players
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| p.stocks > 0)
+        .map(|(i, _)| i)
+        .collect();
+    let loser_count = players.iter().filter(|p| p.stocks == 0).count();
+
+    if player_count <= 2 && winners.len() == 1 && loser_count == 1 {
+        return true;
+    }
+    if player_count <= 4
+        && (1..=2).contains(&winners.len())
+        && loser_count >= 2
+        && !matches!(winners.as_slice(), [0, 2] | [1, 3])
+    {
+        return true;
+    }
+    if remaining_frames == 0 && !players.is_empty() {
+        let first = &players[0];
+        if players
+            .iter()
+            .all(|p| p.stocks == first.stocks && p.damage == first.damage)
+        {
+            return false;
+        }
+        return true;
+    }
+    false
+}
+
+/// Port of reframed2startgg `isGameOver`. Stock/timeout win is the fast path;
+/// `is_results` is the fallback. Ice Climbers skip stock detection while still in match.
+fn is_game_over(is_results: bool, is_match: bool) -> bool {
+    let remaining = GAME_INFO.remaining_frames.load(Ordering::SeqCst);
+    let filter_invalid = is_match && !is_results;
+    let players = collect_players(filter_invalid);
+    if players.len() > 1 && is_match && players.iter().any(|p| is_ice_climbers(p.character)) {
+        return false;
+    }
+    is_results || has_singles_or_doubles_winner(&players, remaining)
+}
+
+fn dump_game_info_snapshot() -> bool {
+    match serde_json::to_vec(&GAME_INFO) {
+        Ok(mut data) => {
+            data.push(b'\n');
+            results_log::write_snapshot(&data)
+        }
+        Err(e) => {
+            println!("[smush_info] results snapshot serialize failed: {}", e);
+            false
+        }
+    }
+}
+
+unsafe fn update_match_state(prev_game_over: &mut bool, last_dump: &mut Option<Instant>) {
+    // FighterManager singleton may not exist yet (early in app boot, before title screen)
+    // and FIGHTER_MANAGER_ADDR can be 0 if LookupSymbol failed. Treat both as "no match"
+    // to avoid dereferencing a null this-pointer in entry_count/is_result_mode.
+    let mgr: *mut app::FighterManager = if FIGHTER_MANAGER_ADDR == 0 {
+        std::ptr::null_mut()
+    } else {
+        *(FIGHTER_MANAGER_ADDR as *mut *mut app::FighterManager)
+    };
+    let current_menu: u32 = *(offset_to_addr(0x53040f0) as *const u32);
+    const CONTROLS_SCREEN_MENU: u32 = 0x6020000; //is_match is set to true when the player in the controls screen, i assume because there is a sandbag and mario. this ensures we're not in the controls screen
+    const MII_MAKER_MENU: u32 = 0x4050000; //performs same check to make sure we're not on mii maker
+    let menu_is_gameplay = current_menu != CONTROLS_SCREEN_MENU && current_menu != MII_MAKER_MENU;
+    let is_results = !mgr.is_null()
+        && FighterManager::entry_count(mgr) > 0
+        && menu_is_gameplay
+        && FighterManager::is_result_mode(mgr);
+    let is_match = !mgr.is_null()
+        && FighterManager::entry_count(mgr) > 0
+        && !FighterManager::is_result_mode(mgr)
+        && menu_is_gameplay;
+
+    if is_match {
+        GAME_INFO.remaining_frames.store(get_remaining_time_as_frame(), Ordering::SeqCst);
+        GAME_INFO.is_match.store(true, Ordering::SeqCst);
+    }
+
+    let game_over = is_game_over(is_results, is_match);
+    if game_over && !*prev_game_over {
+        let cooldown_ok = last_dump
+            .map(|t| t.elapsed() >= SNAPSHOT_COOLDOWN)
+            .unwrap_or(true);
+        if cooldown_ok {
+            if is_results {
+                GAME_INFO.is_results_screen.store(true, Ordering::SeqCst);
+            }
+            if dump_game_info_snapshot() {
+                *last_dump = Some(Instant::now());
+            }
+        }
+    }
+
+    if !is_match {
+        GAME_INFO.remaining_frames.store(-1.0 as u32, Ordering::SeqCst);
+        GAME_INFO.is_match.store(false, Ordering::SeqCst);
+        for player in &GAME_INFO.players {
+            player.is_in_game.store(false, Ordering::SeqCst);
+            player.team.store(-1, Ordering::SeqCst);
+        }
+    }
+
+    GAME_INFO.current_menu.store(current_menu, Ordering::SeqCst);
+    if !mgr.is_null() && FighterManager::entry_count(mgr) > 0 && menu_is_gameplay {
+        GAME_INFO.is_results_screen.store(FighterManager::is_result_mode(mgr), Ordering::SeqCst);
+    }
+
+    *prev_game_over = game_over;
+}
+
+fn match_state_loop() {
+    let mut prev_game_over = false;
+    let mut last_dump: Option<Instant> = None;
+    loop {
+        unsafe {
+            update_match_state(&mut prev_game_over, &mut last_dump);
+        }
+        std::thread::sleep(Duration::from_millis(16));
+    }
+}
+
 #[allow(unreachable_code)]
 fn start_server() -> Result<(), i64> {
     unsafe {
@@ -229,40 +396,6 @@ fn start_server() -> Result<(), i64> {
 
 
         loop {
-            // FighterManager singleton may not exist yet (early in app boot, before title screen)
-            // and FIGHTER_MANAGER_ADDR can be 0 if LookupSymbol failed. Treat both as "no match"
-            // to avoid dereferencing a null this-pointer in entry_count/is_result_mode.
-            let mgr: *mut app::FighterManager = if FIGHTER_MANAGER_ADDR == 0 {
-                std::ptr::null_mut()
-            } else {
-                *(FIGHTER_MANAGER_ADDR as *mut *mut app::FighterManager)
-            };
-            let current_menu: u32 = *(offset_to_addr(0x53040f0) as *const u32);
-            const CONTROLS_SCREEN_MENU: u32 = 0x6020000; //is_match is set to true when the player in the controls screen, i assume because there is a sandbag and mario. this ensures we're not in the controls screen
-            const MII_MAKER_MENU: u32 = 0x4050000; //performs same check to make sure we're not on mii maker
-            let menu_is_gameplay = current_menu != CONTROLS_SCREEN_MENU && current_menu != MII_MAKER_MENU;
-            let is_match = !mgr.is_null()
-                && FighterManager::entry_count(mgr) > 0
-                && !FighterManager::is_result_mode(mgr)
-                && menu_is_gameplay;
-
-            if is_match {
-                GAME_INFO.remaining_frames.store(get_remaining_time_as_frame(), Ordering::SeqCst);
-                GAME_INFO.is_match.store(true, Ordering::SeqCst);
-            } else {
-                GAME_INFO.remaining_frames.store(-1.0 as u32, Ordering::SeqCst);
-                GAME_INFO.is_match.store(false, Ordering::SeqCst);
-                for player in &GAME_INFO.players {
-                    player.is_in_game.store(false, Ordering::SeqCst);
-                    player.team.store(-1, Ordering::SeqCst);
-                }
-            }
-
-            GAME_INFO.current_menu.store(current_menu, Ordering::SeqCst);
-            if !mgr.is_null() && FighterManager::entry_count(mgr) > 0 && menu_is_gameplay {
-                GAME_INFO.is_results_screen.store(FighterManager::is_result_mode(mgr), Ordering::SeqCst);
-            }
-
             let mut data = serde_json::to_vec(&GAME_INFO).unwrap();
             data.push(b'\n');
             match send_bytes(client_socket, &data) {
@@ -754,6 +887,7 @@ pub fn main() {
     );
     install_fighter_frame_hook();
 
+    std::thread::spawn(match_state_loop);
     std::thread::spawn(server_supervisor);
 
     std::thread::spawn(||{
