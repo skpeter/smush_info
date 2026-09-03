@@ -176,6 +176,9 @@ struct PlayerSnap {
 fn collect_players(filter_invalid: bool, out: &mut [PlayerSnap; 8]) -> usize {
     let mut n = 0;
     for p in &GAME_INFO.players {
+        if n >= out.len() {
+            break;
+        }
         let snap = PlayerSnap {
             stocks: p.stocks.load(Ordering::SeqCst),
             damage: p.damage.load(Ordering::SeqCst),
@@ -244,6 +247,7 @@ fn has_singles_or_doubles_winner(players: &[PlayerSnap], remaining_frames: u32) 
 
 /// Port of reframed2startgg `isGameOver`. Stock/timeout win is the fast path;
 /// `is_results` is the fallback. Ice Climbers skip stock detection while still in match.
+#[inline(never)]
 fn is_game_over(is_results: bool, is_match: bool) -> bool {
     let remaining = GAME_INFO.remaining_frames.load(Ordering::SeqCst);
     let filter_invalid = is_match && !is_results;
@@ -260,6 +264,7 @@ fn is_game_over(is_results: bool, is_match: bool) -> bool {
     is_results || has_singles_or_doubles_winner(players, remaining)
 }
 
+#[inline(never)]
 fn dump_game_info_snapshot() -> bool {
     match serde_json::to_vec(&GAME_INFO) {
         Ok(mut data) => {
@@ -279,6 +284,7 @@ struct MatchTickState {
     ticks_since_dump: u64,
 }
 
+#[inline(never)]
 unsafe fn update_match_state(state: &mut MatchTickState) {
     // FighterManager singleton may not exist yet (early in app boot, before title screen)
     // and FIGHTER_MANAGER_ADDR can be 0 if LookupSymbol failed. Treat both as "no match"
@@ -337,21 +343,6 @@ unsafe fn update_match_state(state: &mut MatchTickState) {
 
     state.prev_game_over = game_over;
     state.ticks_since_dump = state.ticks_since_dump.saturating_add(1);
-}
-
-fn match_state_loop() {
-    std::thread::sleep(Duration::from_secs(2));
-    let mut state = MatchTickState {
-        prev_game_over: false,
-        saw_match: false,
-        ticks_since_dump: SNAPSHOT_COOLDOWN_TICKS,
-    };
-    loop {
-        unsafe {
-            update_match_state(&mut state);
-        }
-        std::thread::sleep(Duration::from_millis(MATCH_TICK_MS));
-    }
 }
 
 #[allow(unreachable_code)]
@@ -876,6 +867,39 @@ pub unsafe fn special_lw_close_window_hook(fighter: &mut app::Fighter, arg2: boo
     call_original!(fighter, arg2, no_decide, arg4);
 }
 
+fn udp_and_match_loop() {
+    std::thread::sleep(Duration::from_secs(5));
+    println!("[smush_info] starting broadcast");
+    let mut state = MatchTickState {
+        prev_game_over: false,
+        saw_match: false,
+        ticks_since_dump: SNAPSHOT_COOLDOWN_TICKS,
+    };
+    let mut udp_ticks: u32 = 0;
+    loop {
+        unsafe {
+            update_match_state(&mut state);
+        }
+        udp_ticks = udp_ticks.wrapping_add(1);
+        if udp_ticks >= 62 {
+            udp_ticks = 0;
+            udp::broadcast_device_info();
+        }
+        std::thread::sleep(Duration::from_millis(MATCH_TICK_MS));
+    }
+}
+
+fn spawn_udp_and_match() {
+    // Skyline default thread stack is 64KB. Dump/serde frames blow that → brk #1.
+    const STACK: usize = 512 * 1024;
+    let spawned = std::thread::Builder::new()
+        .stack_size(STACK)
+        .spawn(udp_and_match_loop);
+    if spawned.is_err() {
+        std::thread::spawn(udp_and_match_loop);
+    }
+}
+
 #[skyline::main(name = "discord_server")]
 pub fn main() {
     search_offsets();
@@ -912,17 +936,6 @@ pub fn main() {
     );
     install_fighter_frame_hook();
 
-    std::thread::spawn(match_state_loop);
     std::thread::spawn(server_supervisor);
-
-    std::thread::spawn(||{
-        std::thread::sleep(std::time::Duration::from_secs(5));
-        println!("[smush_info] starting broadcast");
-        loop {
-            std::thread::sleep(std::time::Duration::from_secs(1));
-            udp::broadcast_device_info();
-        }
-            
-    });
-
+    spawn_udp_and_match();
 }

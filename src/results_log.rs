@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 const DIR: &str = "sd:/smush_info";
 const MAX_FILES: usize = 100;
 
+#[inline(never)]
 fn timestamp_filename() -> Option<String> {
     unsafe {
         if !nnsdk::time::IsInitialized() {
@@ -41,6 +42,7 @@ fn timestamp_filename() -> Option<String> {
     }
 }
 
+#[inline(never)]
 pub fn write_snapshot(json: &[u8]) -> bool {
     let dir = Path::new(DIR);
     if !dir.is_dir() {
@@ -58,6 +60,7 @@ pub fn write_snapshot(json: &[u8]) -> bool {
     true
 }
 
+#[inline(never)]
 fn prune_oldest(just_written_name: Option<&std::ffi::OsStr>) {
     let entries = match fs::read_dir(DIR) {
         Ok(it) => it,
