@@ -1,7 +1,5 @@
-use std::cmp::Ordering;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
 
 const DIR: &str = "sd:/smush_info";
 const MAX_FILES: usize = 100;
@@ -9,7 +7,7 @@ const MAX_FILES: usize = 100;
 fn timestamp_filename() -> Option<String> {
     unsafe {
         if !nnsdk::time::IsInitialized() {
-            nnsdk::time::Initialize();
+            return None;
         }
         let mut posix = nnsdk::time::PosixTime { time: 0 };
         let rc = nnsdk::time::StandardUserSystemClock::GetCurrentTime(&mut posix);
@@ -69,24 +67,18 @@ fn prune_oldest(just_written_name: Option<&std::ffi::OsStr>) {
         }
     };
 
-    struct FileInfo {
-        path: PathBuf,
-        name: String,
-        modified: Option<SystemTime>,
-    }
-
-    let mut files: Vec<FileInfo> = Vec::new();
+    let mut files: Vec<(PathBuf, String)> = Vec::new();
     for entry in entries {
         let entry = match entry {
             Ok(e) => e,
             Err(_) => continue,
         };
         let path = entry.path();
-        let meta = match entry.metadata() {
-            Ok(m) => m,
+        let is_file = match entry.metadata() {
+            Ok(m) => m.is_file(),
             Err(_) => continue,
         };
-        if !meta.is_file() {
+        if !is_file {
             continue;
         }
         let name = path
@@ -94,11 +86,7 @@ fn prune_oldest(just_written_name: Option<&std::ffi::OsStr>) {
             .and_then(|n| n.to_str())
             .unwrap_or("")
             .to_string();
-        files.push(FileInfo {
-            path,
-            name,
-            modified: meta.modified().ok(),
-        });
+        files.push((path, name));
     }
 
     if files.len() <= MAX_FILES {
@@ -107,17 +95,12 @@ fn prune_oldest(just_written_name: Option<&std::ffi::OsStr>) {
 
     let oldest = files
         .iter()
-        .filter(|f| just_written_name.map(|n| f.path.file_name() != Some(n)).unwrap_or(true))
-        .min_by(|a, b| match (a.modified, b.modified) {
-            (Some(ta), Some(tb)) => ta.cmp(&tb),
-            (Some(_), None) => Ordering::Less,
-            (None, Some(_)) => Ordering::Greater,
-            (None, None) => a.name.cmp(&b.name),
-        });
+        .filter(|(p, _)| just_written_name.map(|n| p.file_name() != Some(n)).unwrap_or(true))
+        .min_by(|a, b| a.1.cmp(&b.1));
 
-    if let Some(oldest) = oldest {
-        if let Err(e) = fs::remove_file(&oldest.path) {
-            println!("[smush_info] failed to prune {:?}: {}", oldest.path, e);
+    if let Some((path, _)) = oldest {
+        if let Err(e) = fs::remove_file(path) {
+            println!("[smush_info] failed to prune {:?}: {}", path, e);
         }
     }
 }

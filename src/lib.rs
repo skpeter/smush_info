@@ -4,7 +4,7 @@
 use skyline::hooks::{getRegionAddress, Region, InlineCtx};
 use skyline::from_c_str;
 use skyline::libc::*;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use std::mem::size_of_val;
 use std::sync::atomic::Ordering;
 
@@ -163,37 +163,35 @@ fn install_fighter_frame_hook() {
 
 static GAME_INFO: Info = Info::new();
 
-const SNAPSHOT_COOLDOWN: Duration = Duration::from_secs(120);
+const MATCH_TICK_MS: u64 = 16;
+const SNAPSHOT_COOLDOWN_TICKS: u64 = 120_000 / MATCH_TICK_MS;
 
+#[derive(Clone, Copy)]
 struct PlayerSnap {
     stocks: u32,
     damage: f32,
     character: u32,
 }
 
-fn collect_players(filter_invalid: bool) -> Vec<PlayerSnap> {
-    GAME_INFO
-        .players
-        .iter()
-        .filter_map(|p| {
-            let snap = PlayerSnap {
-                stocks: p.stocks.load(Ordering::SeqCst),
-                damage: p.damage.load(Ordering::SeqCst),
-                character: p.character.load(Ordering::SeqCst),
-            };
-            if filter_invalid {
-                let in_game = p.is_in_game.load(Ordering::SeqCst);
-                let cpu = p.is_cpu.load(Ordering::SeqCst);
-                if in_game || cpu {
-                    Some(snap)
-                } else {
-                    None
-                }
-            } else {
-                Some(snap)
+fn collect_players(filter_invalid: bool, out: &mut [PlayerSnap; 8]) -> usize {
+    let mut n = 0;
+    for p in &GAME_INFO.players {
+        let snap = PlayerSnap {
+            stocks: p.stocks.load(Ordering::SeqCst),
+            damage: p.damage.load(Ordering::SeqCst),
+            character: p.character.load(Ordering::SeqCst),
+        };
+        if filter_invalid {
+            let in_game = p.is_in_game.load(Ordering::SeqCst);
+            let cpu = p.is_cpu.load(Ordering::SeqCst);
+            if !(in_game || cpu) {
+                continue;
             }
-        })
-        .collect()
+        }
+        out[n] = snap;
+        n += 1;
+    }
+    n
 }
 
 fn is_ice_climbers(character: u32) -> bool {
@@ -203,21 +201,31 @@ fn is_ice_climbers(character: u32) -> bool {
 /// Port of reframed2startgg `hasSinglesOrDoublesWinner` (winner presence only).
 fn has_singles_or_doubles_winner(players: &[PlayerSnap], remaining_frames: u32) -> bool {
     let player_count = players.len();
-    let winners: Vec<usize> = players
-        .iter()
-        .enumerate()
-        .filter(|(_, p)| p.stocks > 0)
-        .map(|(i, _)| i)
-        .collect();
-    let loser_count = players.iter().filter(|p| p.stocks == 0).count();
+    let mut winners = [0usize; 8];
+    let mut winner_count = 0usize;
+    let mut loser_count = 0usize;
+    for (i, p) in players.iter().enumerate() {
+        if p.stocks > 0 {
+            winners[winner_count] = i;
+            winner_count += 1;
+        } else {
+            loser_count += 1;
+        }
+    }
 
-    if player_count <= 2 && winners.len() == 1 && loser_count == 1 {
+    if player_count <= 2 && winner_count == 1 && loser_count == 1 {
         return true;
     }
+    let winner_pair = if winner_count == 2 {
+        Some((winners[0], winners[1]))
+    } else {
+        None
+    };
     if player_count <= 4
-        && (1..=2).contains(&winners.len())
+        && (1..=2).contains(&winner_count)
         && loser_count >= 2
-        && !matches!(winners.as_slice(), [0, 2] | [1, 3])
+        && winner_pair != Some((0, 2))
+        && winner_pair != Some((1, 3))
     {
         return true;
     }
@@ -239,11 +247,17 @@ fn has_singles_or_doubles_winner(players: &[PlayerSnap], remaining_frames: u32) 
 fn is_game_over(is_results: bool, is_match: bool) -> bool {
     let remaining = GAME_INFO.remaining_frames.load(Ordering::SeqCst);
     let filter_invalid = is_match && !is_results;
-    let players = collect_players(filter_invalid);
+    let mut buf = [PlayerSnap {
+        stocks: 0,
+        damage: 0.0,
+        character: 0,
+    }; 8];
+    let n = collect_players(filter_invalid, &mut buf);
+    let players = &buf[..n];
     if players.len() > 1 && is_match && players.iter().any(|p| is_ice_climbers(p.character)) {
         return false;
     }
-    is_results || has_singles_or_doubles_winner(&players, remaining)
+    is_results || has_singles_or_doubles_winner(players, remaining)
 }
 
 fn dump_game_info_snapshot() -> bool {
@@ -259,7 +273,13 @@ fn dump_game_info_snapshot() -> bool {
     }
 }
 
-unsafe fn update_match_state(prev_game_over: &mut bool, last_dump: &mut Option<Instant>) {
+struct MatchTickState {
+    prev_game_over: bool,
+    saw_match: bool,
+    ticks_since_dump: u64,
+}
+
+unsafe fn update_match_state(state: &mut MatchTickState) {
     // FighterManager singleton may not exist yet (early in app boot, before title screen)
     // and FIGHTER_MANAGER_ADDR can be 0 if LookupSymbol failed. Treat both as "no match"
     // to avoid dereferencing a null this-pointer in entry_count/is_result_mode.
@@ -284,20 +304,16 @@ unsafe fn update_match_state(prev_game_over: &mut bool, last_dump: &mut Option<I
     if is_match {
         GAME_INFO.remaining_frames.store(get_remaining_time_as_frame(), Ordering::SeqCst);
         GAME_INFO.is_match.store(true, Ordering::SeqCst);
+        state.saw_match = true;
     }
 
-    let game_over = is_game_over(is_results, is_match);
-    if game_over && !*prev_game_over {
-        let cooldown_ok = last_dump
-            .map(|t| t.elapsed() >= SNAPSHOT_COOLDOWN)
-            .unwrap_or(true);
-        if cooldown_ok {
-            if is_results {
-                GAME_INFO.is_results_screen.store(true, Ordering::SeqCst);
-            }
-            if dump_game_info_snapshot() {
-                *last_dump = Some(Instant::now());
-            }
+    let game_over = state.saw_match && is_game_over(is_results, is_match);
+    if game_over && !state.prev_game_over && state.ticks_since_dump >= SNAPSHOT_COOLDOWN_TICKS {
+        if is_results {
+            GAME_INFO.is_results_screen.store(true, Ordering::SeqCst);
+        }
+        if dump_game_info_snapshot() {
+            state.ticks_since_dump = 0;
         }
     }
 
@@ -315,17 +331,26 @@ unsafe fn update_match_state(prev_game_over: &mut bool, last_dump: &mut Option<I
         GAME_INFO.is_results_screen.store(FighterManager::is_result_mode(mgr), Ordering::SeqCst);
     }
 
-    *prev_game_over = game_over;
+    if !is_match && !is_results {
+        state.saw_match = false;
+    }
+
+    state.prev_game_over = game_over;
+    state.ticks_since_dump = state.ticks_since_dump.saturating_add(1);
 }
 
 fn match_state_loop() {
-    let mut prev_game_over = false;
-    let mut last_dump: Option<Instant> = None;
+    std::thread::sleep(Duration::from_secs(2));
+    let mut state = MatchTickState {
+        prev_game_over: false,
+        saw_match: false,
+        ticks_since_dump: SNAPSHOT_COOLDOWN_TICKS,
+    };
     loop {
         unsafe {
-            update_match_state(&mut prev_game_over, &mut last_dump);
+            update_match_state(&mut state);
         }
-        std::thread::sleep(Duration::from_millis(16));
+        std::thread::sleep(Duration::from_millis(MATCH_TICK_MS));
     }
 }
 
