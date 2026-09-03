@@ -152,6 +152,10 @@ unsafe extern "C" fn once_per_frame_per_fighter(fighter: &mut SmashlineFighterCo
     let screen_pos = as_pixels(pos);
     GAME_INFO.players[player_num].x.store(screen_pos.x, Ordering::SeqCst);
     GAME_INFO.players[player_num].y.store(screen_pos.y, Ordering::SeqCst);
+    // Game thread stack is ~1MB. Rust plugin threads are 64KB and abort if dump/serde inlines in.
+    if player_num == 0 {
+        tick_match_state();
+    }
 }
 
 fn install_fighter_frame_hook() {
@@ -284,6 +288,19 @@ struct MatchTickState {
     ticks_since_dump: u64,
 }
 
+static mut MATCH_TICK: MatchTickState = MatchTickState {
+    prev_game_over: false,
+    saw_match: false,
+    ticks_since_dump: SNAPSHOT_COOLDOWN_TICKS,
+};
+
+#[inline(never)]
+fn tick_match_state() {
+    unsafe {
+        update_match_state(&mut MATCH_TICK);
+    }
+}
+
 #[inline(never)]
 unsafe fn update_match_state(state: &mut MatchTickState) {
     // FighterManager singleton may not exist yet (early in app boot, before title screen)
@@ -318,7 +335,8 @@ unsafe fn update_match_state(state: &mut MatchTickState) {
         if is_results {
             GAME_INFO.is_results_screen.store(true, Ordering::SeqCst);
         }
-        if dump_game_info_snapshot() {
+        let dump: fn() -> bool = dump_game_info_snapshot;
+        if std::hint::black_box(dump)() {
             state.ticks_since_dump = 0;
         }
     }
@@ -412,6 +430,7 @@ fn start_server() -> Result<(), i64> {
 
 
         loop {
+            tick_match_state();
             let mut data = serde_json::to_vec(&GAME_INFO).unwrap();
             data.push(b'\n');
             match send_bytes(client_socket, &data) {
@@ -867,36 +886,14 @@ pub unsafe fn special_lw_close_window_hook(fighter: &mut app::Fighter, arg2: boo
     call_original!(fighter, arg2, no_decide, arg4);
 }
 
-fn udp_and_match_loop() {
-    std::thread::sleep(Duration::from_secs(5));
-    println!("[smush_info] starting broadcast");
-    let mut state = MatchTickState {
-        prev_game_over: false,
-        saw_match: false,
-        ticks_since_dump: SNAPSHOT_COOLDOWN_TICKS,
-    };
-    let mut udp_ticks: u32 = 0;
+#[inline(never)]
+fn udp_broadcast_loop() {
     loop {
-        unsafe {
-            update_match_state(&mut state);
-        }
-        udp_ticks = udp_ticks.wrapping_add(1);
-        if udp_ticks >= 62 {
-            udp_ticks = 0;
-            udp::broadcast_device_info();
-        }
-        std::thread::sleep(Duration::from_millis(MATCH_TICK_MS));
-    }
-}
-
-fn spawn_udp_and_match() {
-    // Skyline default thread stack is 64KB. Dump/serde frames blow that → brk #1.
-    const STACK: usize = 512 * 1024;
-    let spawned = std::thread::Builder::new()
-        .stack_size(STACK)
-        .spawn(udp_and_match_loop);
-    if spawned.is_err() {
-        std::thread::spawn(udp_and_match_loop);
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        udp::broadcast_device_info();
+        // 1Hz results fallback when no overlay and no fighter frames (e.g. IC → results).
+        let tick: fn() = tick_match_state;
+        std::hint::black_box(tick)();
     }
 }
 
@@ -937,5 +934,11 @@ pub fn main() {
     install_fighter_frame_hook();
 
     std::thread::spawn(server_supervisor);
-    spawn_udp_and_match();
+
+    std::thread::spawn(|| {
+        std::thread::sleep(std::time::Duration::from_secs(5));
+        println!("[smush_info] starting broadcast");
+        let start: fn() = udp_broadcast_loop;
+        std::hint::black_box(start)();
+    });
 }
