@@ -4,6 +4,8 @@ on:
   workflow_dispatch:
   push:
   pull_request:
+  release:
+    types: [published]
 
 env:
   CARGO_TERM_COLOR: always
@@ -30,10 +32,18 @@ jobs:
       - name: Build release NRO
         id: build_release
         run: RUSTFLAGS=-g cargo-skyline skyline build --release
-      - name: Upload binaries to release
+      - name: Package SD zip
+        run: bash scripts/package-sd.sh
+      - name: Upload SD zip artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: smush_info-sd
+          path: smush_info-sd.zip
+      - name: Upload SD zip to GitHub Release
+        if: github.event_name == 'release'
         uses: svenstaro/upload-release-action@v2
         with:
           repo_token: ${{ secrets.GITHUB_TOKEN }}
-          file: target/aarch64-skyline-switch/release/libsmush_info.nro
-          tag: ${{ github.ref }}
+          file: smush_info-sd.zip
+          tag: ${{ github.event.release.tag_name }}
           overwrite: true

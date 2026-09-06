@@ -23,6 +23,7 @@ use smashline::{Agent, L2CFighterCommon as SmashlineFighterCommon, Main};
 
 mod conversions;
 use conversions::{kind_to_char, stage_id_to_stage};
+mod overrides;
 mod results_log;
 mod replay_dump;
 mod udp;
@@ -166,7 +167,7 @@ fn install_fighter_frame_hook() {
 }
 
 
-static GAME_INFO: Info = Info::new();
+pub(crate) static GAME_INFO: Info = Info::new();
 
 const MATCH_TICK_MS: u64 = 16;
 const SNAPSHOT_COOLDOWN_TICKS: u64 = 120_000 / MATCH_TICK_MS;
@@ -279,6 +280,20 @@ fn game_version() -> String {
 
 #[inline(never)]
 fn dump_game_info_snapshot() -> bool {
+    let log = overrides::results_log();
+    let replay = overrides::replay_save();
+    if !log && !replay {
+        return true;
+    }
+    if !log {
+        return match results_log::timestamp_stem() {
+            Some(stem) => {
+                replay_dump::on_json_written(stem);
+                true
+            }
+            None => false,
+        };
+    }
     match serde_json::to_value(&GAME_INFO) {
         Ok(mut value) => {
             if let Some(obj) = value.as_object_mut() {
@@ -292,7 +307,9 @@ fn dump_game_info_snapshot() -> bool {
                     data.push(b'\n');
                     match results_log::write_snapshot(&data) {
                         Some(stem) => {
-                            replay_dump::on_json_written(stem);
+                            if replay {
+                                replay_dump::on_json_written(stem);
+                            }
                             true
                         }
                         None => false,
@@ -935,6 +952,7 @@ fn udp_broadcast_loop() {
 
 #[skyline::main(name = "discord_server")]
 pub fn main() {
+    overrides::load();
     search_offsets();
     skyline::nro::add_hook(nro_main).unwrap();
     unsafe {

@@ -14,10 +14,32 @@ Seems jam1garner has left the scene so I don't feel particularly comfortable ask
 smush_info requires you to have the following Skyline plugins downloaded and installed:
 - [Arcropolis](https://github.com/Raytwo/ARCropolis/releases)
 - [Smashline V2](https://github.com/HDR-Development/smashline/releases) (`libsmashline_plugin.nro`)
-- [libnn_hid_hook](https://github.com/jugeeya/nn-hid-hook/releases/tag/beta)
 - [libnro_hook](https://github.com/ultimate-research/nro-hook-plugin/releases)
 
 Do not install `libacmd_hook.nro` alongside Smashline; both hook ACMD dispatch and will crash when loading a match.
+
+Replay `.bin` dumps sit next to the JSON under `sd:/smush_info/`. HID is hooked via `LookupSymbol` + `A64HookFunction` on nnSdk `GetNpadState` / `GetNpadStates`. **Keep** `libnn_hid_hook.nro` if other mods need it — we wrap the same `GetNpadState` symbols (Skyline chains; we mask after their callbacks). **Do not** also install [Auto-Save Replays](https://gamebanana.com/mods/394784) or results-screen-skip (they OR buttons on results and fight this). After results is detected, **mute all pads immediately**, wait **~8s**, then tap **A → A → Y → D-pad right → A → A** on **P1/handheld only** (0.25s between taps). Other pads stay muted so they cannot skip. HOME/suspend **pauses** the wait + save seq (focus + GetNpad stall). Wait **2s** for the Vault write, then tap **A** on every pad until results end. Watch `:4242` JSON: `hid_hooks` (0–12), `hid_npad_hits`, `hid_masking`, `hid_elapsed_ms`. Vault NAND still fills.
+
+Release zip extracts to SD root:
+```
+atmosphere/contents/01006A800016E000/romfs/skyline/plugins/libsmush_info.nro
+ultimate/smush_info/overrides.toml
+```
+
+On boot, plugin reads `sd:/ultimate/smush_info/overrides.toml` if present. Uncomment a flag to disable that feature. Missing file or all flags commented = everything on.
+
+```toml
+[smush_info]
+disable_list = [
+    # "disable_results_log",
+    # "disable_replay_save",
+    # "disable_results_skip",
+]
+```
+
+- `disable_results_log` — no `{stem}.log` snapshot
+- `disable_replay_save` — no auto save seq, no SD `{stem}.bin`
+- `disable_results_skip` — no all-pad A exit after save
 
 # How to Build and Install
 You must have Rust and Cargo installed. [Click here](https://www.rust-lang.org/tools/install) for instructions on how to install based on your system.
@@ -29,13 +51,20 @@ cargo install cargo-skyline
 
 To compile your plugin use the following command in the root of the project (beside the `Cargo.toml` file):
 ```sh
-cargo skyline build
+cargo skyline build --release
 ```
-Your resulting plugin will be the `.nro` found in the folder
+Then pack SD-root zip:
+```sh
+bash scripts/package-sd.sh
+# Windows: powershell -File scripts/package-sd.ps1
 ```
-[plugin name]/target/aarch64-skyline-switch
+Zip is `smush_info-sd.zip`. Extract onto SD root. Later NRO updates: copy plugin only, leave `overrides.toml` alone (re-extract resets flags to commented/on).
+
+NRO alone lives at:
 ```
-To install (you must already have skyline installed on your switch), put the plugin on your SD at:
+target/aarch64-skyline-switch/release/libsmush_info.nro
+```
+Install path:
 ```
 sd:/atmosphere/contents/01006A800016E000/romfs/skyline/plugins
 ```

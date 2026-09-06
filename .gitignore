@@ -3,3 +3,5 @@
 **/*.pyc
 Cargo.lock
 docs/
+dist/
+smush_info-sd.zip

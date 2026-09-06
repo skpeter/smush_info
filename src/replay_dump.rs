@@ -1,7 +1,12 @@
 use crate::results_log;
-use skyline::libc::c_char;
+use skyline::hooks::A64HookFunction;
+use skyline::libc::{c_char, c_void};
+use skyline::nn::hid::{NpadGcState, NpadHandheldState};
+use smash::app::{self, lua_bind::FighterManager};
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::Mutex;
+use std::time::Instant;
 
 const CAP_BYTES: usize = 8 * 1024 * 1024;
 const PROBE_MAX: usize = 50;
@@ -33,6 +38,13 @@ struct DumpState {
     path_confirmed: bool,
     probe_unique: HashSet<String>,
     results: bool,
+    hid_began: Option<Instant>,
+    last_hid_poll: Option<Instant>,
+    hid_released: bool,
+    hid_logged_wait: bool,
+    hid_logged_start: bool,
+    hid_session: bool,
+    hid_unfocused: bool,
 }
 
 impl DumpState {
@@ -43,12 +55,69 @@ impl DumpState {
             path_confirmed: false,
             probe_unique: HashSet::new(),
             results: false,
+            hid_began: None,
+            last_hid_poll: None,
+            hid_released: false,
+            hid_logged_wait: false,
+            hid_logged_start: false,
+            hid_session: false,
+            hid_unfocused: false,
         }
     }
 
     fn probe_window(&self) -> bool {
         self.results
             || matches!(self.pair, Pair::Pending { .. } | Pair::Orphan { .. })
+    }
+
+    fn hid_got_write(&self) -> bool {
+        match &self.pair {
+            Pair::Pending { wrote_bin: true, .. } => true,
+            Pair::Orphan { files } => files.iter().any(|f| magic_score(&f.buf) > 0),
+            _ => false,
+        }
+    }
+
+    fn wants_hid_mask(&self, live_results: bool) -> bool {
+        live_results && !self.hid_released
+    }
+
+    fn reset_hid(&mut self) {
+        self.hid_began = None;
+        self.last_hid_poll = None;
+        self.hid_released = false;
+        self.hid_logged_wait = false;
+        self.hid_logged_start = false;
+        self.hid_session = false;
+        self.hid_unfocused = false;
+    }
+
+    fn begin_hid_session(&mut self) {
+        if self.hid_session {
+            return;
+        }
+        self.reset_hid();
+        self.hid_session = true;
+        let now = Instant::now();
+        self.hid_began = Some(now);
+        self.last_hid_poll = Some(now);
+    }
+
+    fn absorb_suspend_gap(&mut self, now: Instant) {
+        let Some(last) = self.last_hid_poll else {
+            return;
+        };
+        let gap = now.saturating_duration_since(last);
+        if gap.as_millis() < HID_SUSPEND_GAP_MS {
+            return;
+        }
+        if let Some(began) = self.hid_began {
+            self.hid_began = Some(began + gap);
+            println!(
+                "[smush_info] replay auto-save: paused {}ms (HOME/suspend)",
+                gap.as_millis()
+            );
+        }
     }
 }
 
@@ -271,11 +340,23 @@ pub fn on_match_rising() {
     }
     st.pair = Pair::Idle;
     st.results = false;
+    st.reset_hid();
 }
 
 #[inline(never)]
 pub fn set_results(is_results: bool) {
-    lock_state().results = is_results;
+    let mut st = lock_state();
+    if crate::overrides::hid_enabled() && is_results && !st.results {
+        st.begin_hid_session();
+    }
+    st.results = is_results;
+    if st.hid_session {
+        if let Some(t) = st.hid_began {
+            hid_store_elapsed(Instant::now().saturating_duration_since(t).as_millis());
+        }
+    } else {
+        hid_store_elapsed(0);
+    }
 }
 
 fn finish_close(cap: Capture) {
@@ -337,8 +418,417 @@ fn finish_close(cap: Capture) {
     }
 }
 
+const KEY_A: u64 = 1;
+const KEY_Y: u64 = 1 << 3;
+const KEY_RIGHT: u64 = 1 << 14;
+const NPAD_P1: u32 = 0;
+const NPAD_HANDHELD: u32 = 0x20;
+const HID_ANIM_MS: u128 = 8000;
+const HID_SUSPEND_GAP_MS: u128 = 1000;
+const OE_FOCUS_OUT: i32 = 2;
+const OE_FOCUS_BG: i32 = 3;
+const HID_PULSE_MS: u128 = 100;
+const HID_GAP_MS: u128 = 250;
+const HID_VAULT_MS: u128 = 2000;
+const HID_EXIT_MS: u128 = 8000;
+const HID_SAVE_MS: u128 = (HID_PULSE_MS + HID_GAP_MS) * 6;
+
+fn npad_id(id: *const u32) -> u32 {
+    if id.is_null() {
+        0
+    } else {
+        unsafe { *id }
+    }
+}
+
+fn is_save_pad(id: u32) -> bool {
+    id == NPAD_P1 || id == NPAD_HANDHELD
+}
+
+fn hid_exit_a(ms: u128) -> u64 {
+    let cycle = HID_PULSE_MS + HID_GAP_MS;
+    if (ms % cycle) < HID_PULSE_MS {
+        KEY_A
+    } else {
+        0
+    }
+}
+
+fn hid_save_buttons(ms: u128) -> u64 {
+    let steps: [(u64, u128); 6] = [
+        (KEY_A, HID_GAP_MS),
+        (KEY_A, HID_GAP_MS),
+        (KEY_Y, HID_GAP_MS),
+        (KEY_RIGHT, HID_GAP_MS),
+        (KEY_A, HID_GAP_MS),
+        (KEY_A, HID_GAP_MS),
+    ];
+    let mut t = 0u128;
+    for (btn, gap) in steps {
+        if (t..t + HID_PULSE_MS).contains(&ms) {
+            return btn;
+        }
+        t += HID_PULSE_MS + gap;
+    }
+    0
+}
+
+fn hid_save_ms() -> u128 {
+    if crate::overrides::replay_save() {
+        HID_SAVE_MS
+    } else {
+        0
+    }
+}
+
+fn hid_vault_ms() -> u128 {
+    if crate::overrides::replay_save() {
+        HID_VAULT_MS
+    } else {
+        0
+    }
+}
+
+fn hid_buttons_for_pad(action_ms: u128, pad: u32, wrote: bool) -> Option<u64> {
+    let save_ms = hid_save_ms();
+    let vault_ms = hid_vault_ms();
+    let skip = crate::overrides::results_skip();
+    if action_ms < save_ms {
+        if is_save_pad(pad) {
+            Some(hid_save_buttons(action_ms))
+        } else {
+            Some(0)
+        }
+    } else {
+        let after_save = action_ms - save_ms;
+        if crate::overrides::replay_save() && !wrote && after_save < vault_ms {
+            Some(0)
+        } else if skip {
+            let exit_ms = if crate::overrides::replay_save() && !wrote {
+                after_save - vault_ms
+            } else {
+                after_save
+            };
+            if exit_ms >= HID_EXIT_MS {
+                None
+            } else {
+                Some(hid_exit_a(exit_ms))
+            }
+        } else {
+            None
+        }
+    }
+}
+
+fn hid_info() -> &'static smush_info_shared::Info {
+    &crate::GAME_INFO
+}
+
+fn hid_store_elapsed(ms: u128) {
+    hid_info()
+        .hid_elapsed_ms
+        .store(ms.min(u128::from(u32::MAX)) as u32, Ordering::Relaxed);
+}
+
+unsafe fn mask_npad(state: *mut NpadHandheldState, buttons: u64) {
+    if state.is_null() {
+        return;
+    }
+    (*state).Buttons = buttons;
+    (*state).LStickX = 0;
+    (*state).LStickY = 0;
+    (*state).RStickX = 0;
+    (*state).RStickY = 0;
+}
+
+fn hid_count(count: i32) -> usize {
+    count.clamp(0, 16) as usize
+}
+
+fn note_npad_hit() {
+    hid_info().hid_npad_hits.fetch_add(1, Ordering::Relaxed);
+}
+
+fn apply_mask_npads(state: *mut NpadHandheldState, count: i32, id: *const u32) {
+    let Some(buttons) = hid_mask_buttons(npad_id(id)) else {
+        hid_info().hid_masking.store(false, Ordering::Relaxed);
+        return;
+    };
+    hid_info().hid_masking.store(true, Ordering::Relaxed);
+    let n = hid_count(count);
+    unsafe {
+        for i in 0..n {
+            mask_npad(state.add(i), buttons);
+        }
+    }
+}
+
+fn apply_mask_gc(state: *mut NpadGcState, count: i32, id: *const u32) {
+    let Some(buttons) = hid_mask_buttons(npad_id(id)) else {
+        hid_info().hid_masking.store(false, Ordering::Relaxed);
+        return;
+    };
+    hid_info().hid_masking.store(true, Ordering::Relaxed);
+    let n = hid_count(count);
+    unsafe {
+        for i in 0..n {
+            let p = state.add(i);
+            mask_npad(p as *mut NpadHandheldState, buttons);
+            (*p).LTrigger = 0;
+            (*p).RTrigger = 0;
+        }
+    }
+}
+
+static ORIG_STATE: [AtomicPtr<()>; 6] = [
+    AtomicPtr::new(std::ptr::null_mut()),
+    AtomicPtr::new(std::ptr::null_mut()),
+    AtomicPtr::new(std::ptr::null_mut()),
+    AtomicPtr::new(std::ptr::null_mut()),
+    AtomicPtr::new(std::ptr::null_mut()),
+    AtomicPtr::new(std::ptr::null_mut()),
+];
+static ORIG_STATES: [AtomicPtr<()>; 6] = [
+    AtomicPtr::new(std::ptr::null_mut()),
+    AtomicPtr::new(std::ptr::null_mut()),
+    AtomicPtr::new(std::ptr::null_mut()),
+    AtomicPtr::new(std::ptr::null_mut()),
+    AtomicPtr::new(std::ptr::null_mut()),
+    AtomicPtr::new(std::ptr::null_mut()),
+];
+
+unsafe fn call_orig_state(idx: usize, state: *mut NpadHandheldState, id: *const u32) {
+    let p = ORIG_STATE[idx].load(Ordering::Relaxed);
+    if p.is_null() {
+        return;
+    }
+    let f: unsafe extern "C" fn(*mut NpadHandheldState, *const u32) = std::mem::transmute(p);
+    f(state, id);
+}
+
+unsafe fn call_orig_states(idx: usize, state: *mut NpadHandheldState, count: i32, id: *const u32) {
+    let p = ORIG_STATES[idx].load(Ordering::Relaxed);
+    if p.is_null() {
+        return;
+    }
+    let f: unsafe extern "C" fn(*mut NpadHandheldState, i32, *const u32) = std::mem::transmute(p);
+    f(state, count, id);
+}
+
+unsafe extern "C" fn hook_state_hh(state: *mut NpadHandheldState, id: *const u32) {
+    note_npad_hit();
+    call_orig_state(0, state, id);
+    apply_mask_npads(state, 1, id);
+}
+unsafe extern "C" fn hook_state_fk(state: *mut NpadHandheldState, id: *const u32) {
+    note_npad_hit();
+    call_orig_state(1, state, id);
+    apply_mask_npads(state, 1, id);
+}
+unsafe extern "C" fn hook_state_gc(state: *mut NpadGcState, id: *const u32) {
+    note_npad_hit();
+    let p = ORIG_STATE[2].load(Ordering::Relaxed);
+    if !p.is_null() {
+        let f: unsafe extern "C" fn(*mut NpadGcState, *const u32) = std::mem::transmute(p);
+        f(state, id);
+    }
+    apply_mask_gc(state, 1, id);
+}
+unsafe extern "C" fn hook_state_jd(state: *mut NpadHandheldState, id: *const u32) {
+    note_npad_hit();
+    call_orig_state(3, state, id);
+    apply_mask_npads(state, 1, id);
+}
+unsafe extern "C" fn hook_state_jl(state: *mut NpadHandheldState, id: *const u32) {
+    note_npad_hit();
+    call_orig_state(4, state, id);
+    apply_mask_npads(state, 1, id);
+}
+unsafe extern "C" fn hook_state_jr(state: *mut NpadHandheldState, id: *const u32) {
+    note_npad_hit();
+    call_orig_state(5, state, id);
+    apply_mask_npads(state, 1, id);
+}
+
+unsafe extern "C" fn hook_states_hh(state: *mut NpadHandheldState, count: i32, id: *const u32) {
+    note_npad_hit();
+    call_orig_states(0, state, count, id);
+    apply_mask_npads(state, count, id);
+}
+unsafe extern "C" fn hook_states_fk(state: *mut NpadHandheldState, count: i32, id: *const u32) {
+    note_npad_hit();
+    call_orig_states(1, state, count, id);
+    apply_mask_npads(state, count, id);
+}
+unsafe extern "C" fn hook_states_gc(state: *mut NpadGcState, count: i32, id: *const u32) {
+    note_npad_hit();
+    let p = ORIG_STATES[2].load(Ordering::Relaxed);
+    if !p.is_null() {
+        let f: unsafe extern "C" fn(*mut NpadGcState, i32, *const u32) = std::mem::transmute(p);
+        f(state, count, id);
+    }
+    apply_mask_gc(state, count, id);
+}
+unsafe extern "C" fn hook_states_jd(state: *mut NpadHandheldState, count: i32, id: *const u32) {
+    note_npad_hit();
+    call_orig_states(3, state, count, id);
+    apply_mask_npads(state, count, id);
+}
+unsafe extern "C" fn hook_states_jl(state: *mut NpadHandheldState, count: i32, id: *const u32) {
+    note_npad_hit();
+    call_orig_states(4, state, count, id);
+    apply_mask_npads(state, count, id);
+}
+unsafe extern "C" fn hook_states_jr(state: *mut NpadHandheldState, count: i32, id: *const u32) {
+    note_npad_hit();
+    call_orig_states(5, state, count, id);
+    apply_mask_npads(state, count, id);
+}
+
+fn hook_abs(sym: &[u8], replace: *const c_void, orig: &AtomicPtr<()>) -> bool {
+    unsafe {
+        let mut addr: usize = 0;
+        skyline::nn::ro::LookupSymbol(&mut addr, sym.as_ptr());
+        if addr == 0 {
+            return false;
+        }
+        let mut temp: *mut c_void = std::ptr::null_mut();
+        A64HookFunction(addr as *const c_void, replace, &mut temp);
+        orig.store(temp as *mut (), Ordering::SeqCst);
+        true
+    }
+}
+
+fn install_npad_abs_hooks() {
+    let mut n = 0u32;
+    let state: [(&[u8], *const (), usize); 6] = [
+        (b"_ZN2nn3hid12GetNpadStateEPNS0_17NpadHandheldStateERKj\0", hook_state_hh as *const (), 0),
+        (b"_ZN2nn3hid12GetNpadStateEPNS0_16NpadFullKeyStateERKj\0", hook_state_fk as *const (), 1),
+        (b"_ZN2nn3hid12GetNpadStateEPNS0_11NpadGcStateERKj\0", hook_state_gc as *const (), 2),
+        (b"_ZN2nn3hid12GetNpadStateEPNS0_16NpadJoyDualStateERKj\0", hook_state_jd as *const (), 3),
+        (b"_ZN2nn3hid12GetNpadStateEPNS0_16NpadJoyLeftStateERKj\0", hook_state_jl as *const (), 4),
+        (b"_ZN2nn3hid12GetNpadStateEPNS0_17NpadJoyRightStateERKj\0", hook_state_jr as *const (), 5),
+    ];
+    let states: [(&[u8], *const (), usize); 6] = [
+        (b"_ZN2nn3hid13GetNpadStatesEPNS0_17NpadHandheldStateEiRKj\0", hook_states_hh as *const (), 0),
+        (b"_ZN2nn3hid13GetNpadStatesEPNS0_16NpadFullKeyStateEiRKj\0", hook_states_fk as *const (), 1),
+        (b"_ZN2nn3hid13GetNpadStatesEPNS0_11NpadGcStateEiRKj\0", hook_states_gc as *const (), 2),
+        (b"_ZN2nn3hid13GetNpadStatesEPNS0_16NpadJoyDualStateEiRKj\0", hook_states_jd as *const (), 3),
+        (b"_ZN2nn3hid13GetNpadStatesEPNS0_16NpadJoyLeftStateEiRKj\0", hook_states_jl as *const (), 4),
+        (b"_ZN2nn3hid13GetNpadStatesEPNS0_17NpadJoyRightStateEiRKj\0", hook_states_jr as *const (), 5),
+    ];
+    for (sym, hk, idx) in state {
+        if hook_abs(sym, hk as *const c_void, &ORIG_STATE[idx]) {
+            n += 1;
+        }
+    }
+    for (sym, hk, idx) in states {
+        if hook_abs(sym, hk as *const c_void, &ORIG_STATES[idx]) {
+            n += 1;
+        }
+    }
+    hid_info().hid_hooks.store(n, Ordering::SeqCst);
+    println!("[smush_info] replay auto-save HID abs hooks {}/12", n);
+}
+
+unsafe fn live_is_results() -> bool {
+    if crate::FIGHTER_MANAGER_ADDR == 0 {
+        return false;
+    }
+    let mgr = *(crate::FIGHTER_MANAGER_ADDR as *mut *mut app::FighterManager);
+    if mgr.is_null() {
+        return false;
+    }
+    FighterManager::entry_count(mgr) > 0 && FighterManager::is_result_mode(mgr)
+}
+
+fn game_unfocused() -> bool {
+    let s = unsafe { nnsdk::oe::GetCurrentFocusState() };
+    s == OE_FOCUS_OUT || s == OE_FOCUS_BG
+}
+
+fn hid_mask_buttons(pad: u32) -> Option<u64> {
+    if !crate::overrides::hid_enabled() {
+        return None;
+    }
+    let live = unsafe { live_is_results() };
+    let mut st = lock_state();
+    if live {
+        st.begin_hid_session();
+    } else {
+        st.hid_session = false;
+        st.last_hid_poll = None;
+        st.hid_unfocused = false;
+        hid_store_elapsed(0);
+        return None;
+    }
+    let now = Instant::now();
+    if game_unfocused() {
+        if !st.hid_unfocused {
+            st.hid_unfocused = true;
+            println!("[smush_info] replay auto-save: unfocused, pause wait");
+        }
+        return Some(0);
+    }
+    if st.hid_unfocused {
+        st.hid_unfocused = false;
+    }
+    st.absorb_suspend_gap(now);
+    st.last_hid_poll = Some(now);
+    let elapsed = st
+        .hid_began
+        .map(|t| Instant::now().saturating_duration_since(t).as_millis())
+        .unwrap_or(0);
+    hid_store_elapsed(elapsed);
+    if !st.wants_hid_mask(true) {
+        return None;
+    }
+    if elapsed < HID_ANIM_MS {
+        if !st.hid_logged_wait {
+            st.hid_logged_wait = true;
+            println!("[smush_info] replay auto-save: mute pads, wait 8s for results UI");
+        }
+        return Some(0);
+    }
+    if !st.hid_logged_start {
+        st.hid_logged_start = true;
+        let save = crate::overrides::replay_save();
+        let skip = crate::overrides::results_skip();
+        if save && skip {
+            println!("[smush_info] replay auto-save: P1 A A Y Right A A, vault wait, then exit A");
+        } else if save {
+            println!("[smush_info] replay auto-save: P1 A A Y Right A A, vault wait");
+        } else {
+            println!("[smush_info] results skip: A all pads");
+        }
+    }
+    let action_ms = elapsed - HID_ANIM_MS;
+    match hid_buttons_for_pad(action_ms, pad, st.hid_got_write()) {
+        Some(buttons) => Some(buttons),
+        None => {
+            st.hid_released = true;
+            println!("[smush_info] replay auto-save hid done; pads live");
+            None
+        }
+    }
+}
+
 pub fn install() {
-    skyline::install_hooks!(open_file_hook, write_file_hook, set_file_size_hook, close_file_hook);
+    if crate::overrides::replay_save() {
+        skyline::install_hooks!(
+            open_file_hook,
+            write_file_hook,
+            set_file_size_hook,
+            close_file_hook
+        );
+    } else {
+        println!("[smush_info] replay save disabled, skip FS dump hooks");
+    }
+    if crate::overrides::hid_enabled() {
+        install_npad_abs_hooks();
+    } else {
+        println!("[smush_info] HID results seq disabled");
+    }
 }
 
 #[skyline::hook(replace = nnsdk::fs::OpenFile)]

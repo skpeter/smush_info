@@ -14,7 +14,7 @@ fn dir_guard() -> std::sync::MutexGuard<'static, ()> {
 }
 
 #[inline(never)]
-fn timestamp_stem() -> Option<String> {
+pub(crate) fn timestamp_stem() -> Option<String> {
     unsafe {
         if !nnsdk::time::IsInitialized() {
             return None;
@@ -139,6 +139,9 @@ pub fn write_snapshot(json: &[u8]) -> Option<String> {
 
 #[inline(never)]
 pub fn write_replay(stem: &str, data: &[u8]) -> bool {
+    if !crate::overrides::replay_save() {
+        return false;
+    }
     let _g = dir_guard();
     if !ensure_dir() {
         return false;
