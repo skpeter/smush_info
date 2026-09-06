@@ -249,8 +249,6 @@ fn has_singles_or_doubles_winner(players: &[PlayerSnap], remaining_frames: u32) 
     false
 }
 
-/// Port of reframed2startgg `isGameOver`. Stock/timeout win is the fast path;
-/// `is_results` is the fallback. Ice Climbers skip stock detection while still in match.
 #[inline(never)]
 fn is_game_over(is_results: bool, is_match: bool) -> bool {
     let remaining = GAME_INFO.remaining_frames.load(Ordering::SeqCst);

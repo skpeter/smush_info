@@ -46,7 +46,10 @@ fn timestamp_filename() -> Option<String> {
 pub fn write_snapshot(json: &[u8]) -> bool {
     let dir = Path::new(DIR);
     if !dir.is_dir() {
-        return false;
+        if let Err(e) = fs::create_dir_all(dir) {
+            println!("[smush_info] failed to create {}: {}", DIR, e);
+            return false;
+        }
     }
     let Some(name) = timestamp_filename() else {
         return false;
