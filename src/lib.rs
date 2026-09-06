@@ -24,6 +24,7 @@ use smashline::{Agent, L2CFighterCommon as SmashlineFighterCommon, Main};
 mod conversions;
 use conversions::{kind_to_char, stage_id_to_stage};
 mod results_log;
+mod replay_dump;
 mod udp;
 
 static mut OFFSET1 : usize = 0x1b52a0;
@@ -267,11 +268,41 @@ fn is_game_over(is_results: bool, is_match: bool) -> bool {
 }
 
 #[inline(never)]
+fn game_version() -> String {
+    let mut ver = nnsdk::oe::DisplayVersion { name: [0; 16] };
+    unsafe {
+        nnsdk::oe::GetDisplayVersion(&mut ver);
+    }
+    let n = ver.name.iter().position(|&b| b == 0).unwrap_or(ver.name.len());
+    String::from_utf8_lossy(&ver.name[..n]).into_owned()
+}
+
+#[inline(never)]
 fn dump_game_info_snapshot() -> bool {
-    match serde_json::to_vec(&GAME_INFO) {
-        Ok(mut data) => {
-            data.push(b'\n');
-            results_log::write_snapshot(&data)
+    match serde_json::to_value(&GAME_INFO) {
+        Ok(mut value) => {
+            if let Some(obj) = value.as_object_mut() {
+                obj.insert(
+                    "game_version".to_string(),
+                    serde_json::Value::String(game_version()),
+                );
+            }
+            match serde_json::to_vec(&value) {
+                Ok(mut data) => {
+                    data.push(b'\n');
+                    match results_log::write_snapshot(&data) {
+                        Some(stem) => {
+                            replay_dump::on_json_written(stem);
+                            true
+                        }
+                        None => false,
+                    }
+                }
+                Err(e) => {
+                    println!("[smush_info] results snapshot serialize failed: {}", e);
+                    false
+                }
+            }
         }
         Err(e) => {
             println!("[smush_info] results snapshot serialize failed: {}", e);
@@ -282,12 +313,14 @@ fn dump_game_info_snapshot() -> bool {
 
 struct MatchTickState {
     prev_game_over: bool,
+    prev_is_match: bool,
     saw_match: bool,
     ticks_since_dump: u64,
 }
 
 static mut MATCH_TICK: MatchTickState = MatchTickState {
     prev_game_over: false,
+    prev_is_match: false,
     saw_match: false,
     ticks_since_dump: SNAPSHOT_COOLDOWN_TICKS,
 };
@@ -322,6 +355,9 @@ unsafe fn update_match_state(state: &mut MatchTickState) {
         && !FighterManager::is_result_mode(mgr)
         && menu_is_gameplay;
 
+    if is_match && !state.prev_is_match {
+        replay_dump::on_match_rising();
+    }
     if is_match {
         GAME_INFO.remaining_frames.store(get_remaining_time_as_frame(), Ordering::SeqCst);
         GAME_INFO.is_match.store(true, Ordering::SeqCst);
@@ -349,6 +385,7 @@ unsafe fn update_match_state(state: &mut MatchTickState) {
     }
 
     GAME_INFO.current_menu.store(current_menu, Ordering::SeqCst);
+    replay_dump::set_results(is_results);
     if !mgr.is_null() && FighterManager::entry_count(mgr) > 0 && menu_is_gameplay {
         GAME_INFO.is_results_screen.store(FighterManager::is_result_mode(mgr), Ordering::SeqCst);
     }
@@ -358,6 +395,7 @@ unsafe fn update_match_state(state: &mut MatchTickState) {
     }
 
     state.prev_game_over = game_over;
+    state.prev_is_match = is_match;
     state.ticks_since_dump = state.ticks_since_dump.saturating_add(1);
 }
 
@@ -929,6 +967,7 @@ pub fn main() {
         special_lw_decide_command_hook,
         special_lw_select_index_hook
     );
+    replay_dump::install();
     install_fighter_frame_hook();
 
     std::thread::spawn(server_supervisor);
