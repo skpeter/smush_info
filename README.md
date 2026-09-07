@@ -18,7 +18,7 @@ smush_info requires you to have the following Skyline plugins downloaded and ins
 
 Do not install `libacmd_hook.nro` alongside Smashline; both hook ACMD dispatch and will crash when loading a match.
 
-Replay `.bin` dumps sit next to the JSON under `sd:/smush_info/`. HID is hooked via `LookupSymbol` + `A64HookFunction` on nnSdk `GetNpadState` / `GetNpadStates`. **Keep** `libnn_hid_hook.nro` if other mods need it — we wrap the same `GetNpadState` symbols (Skyline chains; we mask after their callbacks). **Do not** also install [Auto-Save Replays](https://gamebanana.com/mods/394784) or results-screen-skip (they OR buttons on results and fight this). After results is detected, **mute all pads immediately**, wait **~8s**, then tap **A → A → Y → D-pad right → A → A** on **P1/handheld only** (0.25s between taps). Other pads stay muted so they cannot skip. HOME/suspend **pauses** the wait + save seq (focus + GetNpad stall). Wait **2s** for the Vault write, then tap **A** on every pad until results end. Watch `:4242` JSON: `hid_hooks` (0–12), `hid_npad_hits`, `hid_masking`, `hid_elapsed_ms`. Vault NAND still fills.
+Replay dumps sit under `sd:/smush_info/{stem}/` using the **Vault filename** (`OpenFile` path). JSON `{stem}.log` gets `replay_file`. Import: copy that inner file into `save_data/replay/` — keep the name. Dump waits for `CloseFile`, skips truncated or missing UTF-16 `"Replay"` + `FRAM`. HID is hooked via `LookupSymbol` + `A64HookFunction` on nnSdk `GetNpadState` / `GetNpadStates`. **Keep** `libnn_hid_hook.nro` if other mods need it — we wrap the same `GetNpadState` symbols (Skyline chains; we mask after their callbacks). **Do not** also install [Auto-Save Replays](https://gamebanana.com/mods/394784) or results-screen-skip (they OR buttons on results and fight this). After results is detected, **mute all pads immediately**, wait **~7.5s**, then tap **A → A → Y → D-pad right → A → A** on the first full pad (Pro/dual/handheld/GC) (0.17s between taps, last A 0.25s). Other pads stay muted so they cannot skip. HOME/suspend **pauses** the wait + save seq (focus + GetNpad stall). Wait **2s** for the Vault write, then tap **A** on every pad until results end. Watch `:4242` JSON: `hid_hooks` (0–12), `hid_npad_hits`, `hid_masking`, `hid_elapsed_ms`. Vault NAND still fills.
 
 Release zip extracts to SD root:
 ```
@@ -38,7 +38,7 @@ disable_list = [
 ```
 
 - `disable_results_log` — no `{stem}.log` snapshot
-- `disable_replay_save` — no auto save seq, no SD `{stem}.bin`
+- `disable_replay_save` — no auto save seq, no SD replay dump
 - `disable_results_skip` — no all-pad A exit after save
 
 # How to Build and Install

@@ -72,6 +72,64 @@ fn stem_of(name: &str) -> Option<&str> {
     }
 }
 
+pub(crate) fn native_filename(path: &str) -> Option<String> {
+    let normalized = path.replace('\\', "/");
+    let base = normalized.rsplit('/').next()?.trim();
+    if base.is_empty() || base == "." || base == ".." {
+        return None;
+    }
+    if base.bytes().any(|b| matches!(b, 0 | b'/' | b'\\')) {
+        return None;
+    }
+    Some(base.to_string())
+}
+
+fn patch_replay_file(stem: &str, replay_file: &str) {
+    let path = Path::new(DIR).join(format!("{}.log", stem));
+    let Ok(raw) = fs::read(&path) else {
+        return;
+    };
+    let mut value: serde_json::Value = match serde_json::from_slice(&raw) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    let Some(obj) = value.as_object_mut() else {
+        return;
+    };
+    obj.insert(
+        "replay_file".to_string(),
+        serde_json::Value::String(replay_file.to_string()),
+    );
+    match serde_json::to_vec(&value) {
+        Ok(mut data) => {
+            if !data.ends_with(&[b'\n']) {
+                data.push(b'\n');
+            }
+            if let Err(e) = fs::write(&path, data) {
+                println!("[smush_info] failed to patch replay_file {:?}: {}", path, e);
+            }
+        }
+        Err(_) => {}
+    }
+}
+
+fn remove_match(stem: &str) {
+    for ext in [".log", ".bin"] {
+        let path = PathBuf::from(DIR).join(format!("{}{}", stem, ext));
+        if path.exists() {
+            if let Err(e) = fs::remove_file(&path) {
+                println!("[smush_info] failed to prune {:?}: {}", path, e);
+            }
+        }
+    }
+    let dir = PathBuf::from(DIR).join(stem);
+    if dir.is_dir() {
+        if let Err(e) = fs::remove_dir_all(&dir) {
+            println!("[smush_info] failed to prune {:?}: {}", dir, e);
+        }
+    }
+}
+
 #[inline(never)]
 fn prune_oldest(keep_stem: &str) {
     let entries = match fs::read_dir(DIR) {
@@ -88,11 +146,7 @@ fn prune_oldest(keep_stem: &str) {
             Ok(e) => e,
             Err(_) => continue,
         };
-        let is_file = match entry.metadata() {
-            Ok(m) => m.is_file(),
-            Err(_) => continue,
-        };
-        if !is_file {
+        if entry.metadata().is_err() {
             continue;
         }
         let name = entry.file_name().to_string_lossy().into_owned();
@@ -109,14 +163,7 @@ fn prune_oldest(keep_stem: &str) {
             Some(s) => s.clone(),
             None => break,
         };
-        for ext in [".log", ".bin"] {
-            let path = PathBuf::from(DIR).join(format!("{}{}", oldest, ext));
-            if path.exists() {
-                if let Err(e) = fs::remove_file(&path) {
-                    println!("[smush_info] failed to prune {:?}: {}", path, e);
-                }
-            }
-        }
+        remove_match(&oldest);
         stems.retain(|s| s != &oldest);
     }
 }
@@ -138,7 +185,7 @@ pub fn write_snapshot(json: &[u8]) -> Option<String> {
 }
 
 #[inline(never)]
-pub fn write_replay(stem: &str, data: &[u8]) -> bool {
+pub fn write_replay(stem: &str, vault_path: &str, data: &[u8]) -> bool {
     if !crate::overrides::replay_save() {
         return false;
     }
@@ -146,11 +193,18 @@ pub fn write_replay(stem: &str, data: &[u8]) -> bool {
     if !ensure_dir() {
         return false;
     }
-    let path = Path::new(DIR).join(format!("{}.bin", stem));
+    let name = native_filename(vault_path).unwrap_or_else(|| "replay.bin".to_string());
+    let dir = Path::new(DIR).join(stem);
+    if let Err(e) = fs::create_dir_all(&dir) {
+        println!("[smush_info] failed to create {:?}: {}", dir, e);
+        return false;
+    }
+    let path = dir.join(&name);
     if let Err(e) = fs::write(&path, data) {
         println!("[smush_info] failed to write replay {:?}: {}", path, e);
         return false;
     }
+    patch_replay_file(stem, &name);
     prune_oldest(stem);
     true
 }

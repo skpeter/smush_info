@@ -45,6 +45,7 @@ struct DumpState {
     hid_logged_start: bool,
     hid_session: bool,
     hid_unfocused: bool,
+    save_npad: Option<u32>,
 }
 
 impl DumpState {
@@ -62,6 +63,7 @@ impl DumpState {
             hid_logged_start: false,
             hid_session: false,
             hid_unfocused: false,
+            save_npad: None,
         }
     }
 
@@ -90,6 +92,7 @@ impl DumpState {
         self.hid_logged_start = false;
         self.hid_session = false;
         self.hid_unfocused = false;
+        self.save_npad = None;
     }
 
     fn begin_hid_session(&mut self) {
@@ -98,6 +101,11 @@ impl DumpState {
         }
         self.reset_hid();
         self.hid_session = true;
+        self.save_npad = pick_save_npad();
+        println!(
+            "[smush_info] replay auto-save: save pad id={:?}",
+            self.save_npad
+        );
         let now = Instant::now();
         self.hid_began = Some(now);
         self.last_hid_poll = Some(now);
@@ -242,7 +250,22 @@ fn log_probe(buf: &[u8], stem: &str, truncated: bool) {
 
 fn emit_bin(stem: &str, cap: &Capture) -> bool {
     log_probe(&cap.buf, stem, cap.truncated);
-    results_log::write_replay(stem, &cap.buf)
+    if cap.truncated {
+        println!(
+            "[smush_info] replay dump skip {}: truncated (need intact CloseFile blob)",
+            stem
+        );
+        return false;
+    }
+    if magic_score(&cap.buf) < 2 {
+        println!(
+            "[smush_info] replay dump skip {}: missing UTF-16 Replay + FRAM header path={}",
+            stem,
+            cap.path
+        );
+        return false;
+    }
+    results_log::write_replay(stem, &cap.path, &cap.buf)
 }
 
 fn pick_best(files: &[Capture]) -> Option<usize> {
@@ -419,19 +442,34 @@ fn finish_close(cap: Capture) {
 }
 
 const KEY_A: u64 = 1;
+const KEY_B: u64 = 1 << 1;
+const KEY_X: u64 = 1 << 2;
 const KEY_Y: u64 = 1 << 3;
+const KEY_LEFT: u64 = 1 << 12;
+const KEY_UP: u64 = 1 << 13;
 const KEY_RIGHT: u64 = 1 << 14;
-const NPAD_P1: u32 = 0;
+const KEY_DOWN: u64 = 1 << 15;
+const KEY_LEFT_SL: u64 = 1 << 24;
+const KEY_LEFT_SR: u64 = 1 << 25;
+const KEY_RIGHT_SL: u64 = 1 << 26;
+const KEY_RIGHT_SR: u64 = 1 << 27;
 const NPAD_HANDHELD: u32 = 0x20;
-const HID_ANIM_MS: u128 = 8000;
+const STYLE_FULLKEY: u32 = 1 << 0;
+const STYLE_HANDHELD: u32 = 1 << 1;
+const STYLE_JOYDUAL: u32 = 1 << 2;
+const STYLE_GC: u32 = 1 << 5;
+const STYLE_FULL: u32 = STYLE_FULLKEY | STYLE_HANDHELD | STYLE_JOYDUAL | STYLE_GC;
+const HID_ANIM_MS: u128 = 7500;
 const HID_SUSPEND_GAP_MS: u128 = 1000;
 const OE_FOCUS_OUT: i32 = 2;
 const OE_FOCUS_BG: i32 = 3;
 const HID_PULSE_MS: u128 = 100;
-const HID_GAP_MS: u128 = 250;
+const HID_GAP_MS: u128 = 170;
+const HID_GAP_LAST_MS: u128 = 250;
 const HID_VAULT_MS: u128 = 2000;
 const HID_EXIT_MS: u128 = 8000;
-const HID_SAVE_MS: u128 = (HID_PULSE_MS + HID_GAP_MS) * 6;
+const HID_SAVE_MS: u128 =
+    (HID_PULSE_MS + HID_GAP_MS) * 5 + (HID_PULSE_MS + HID_GAP_LAST_MS);
 
 fn npad_id(id: *const u32) -> u32 {
     if id.is_null() {
@@ -441,16 +479,44 @@ fn npad_id(id: *const u32) -> u32 {
     }
 }
 
-fn is_save_pad(id: u32) -> bool {
-    id == NPAD_P1 || id == NPAD_HANDHELD
+#[derive(Clone, Copy)]
+enum PadKind {
+    Full,
+    JoyLeft,
+    JoyRight,
 }
 
-fn hid_exit_a(ms: u128) -> u64 {
+fn npad_is_full(id: u32) -> bool {
+    let flags = unsafe { nnsdk::hid::GetNpadStyleSet(&id).flags };
+    flags & STYLE_FULL != 0
+}
+
+fn pick_save_npad() -> Option<u32> {
+    const IDS: [u32; 9] = [0, 1, 2, 3, 4, 5, 6, 7, NPAD_HANDHELD];
+    for id in IDS {
+        if npad_is_full(id) {
+            return Some(id);
+        }
+    }
+    None
+}
+
+fn is_save_pad(id: u32, save_npad: Option<u32>) -> bool {
+    match save_npad {
+        Some(s) => id == s,
+        None => id == 0 || id == NPAD_HANDHELD,
+    }
+}
+
+fn hid_exit_buttons(kind: PadKind, ms: u128) -> u64 {
     let cycle = HID_PULSE_MS + HID_GAP_MS;
-    if (ms % cycle) < HID_PULSE_MS {
-        KEY_A
-    } else {
-        0
+    if (ms % cycle) >= HID_PULSE_MS {
+        return 0;
+    }
+    match kind {
+        PadKind::Full => KEY_A,
+        PadKind::JoyLeft => KEY_A | KEY_LEFT | KEY_RIGHT | KEY_UP | KEY_DOWN | KEY_LEFT_SL | KEY_LEFT_SR,
+        PadKind::JoyRight => KEY_A | KEY_B | KEY_X | KEY_Y | KEY_RIGHT_SL | KEY_RIGHT_SR,
     }
 }
 
@@ -461,7 +527,7 @@ fn hid_save_buttons(ms: u128) -> u64 {
         (KEY_Y, HID_GAP_MS),
         (KEY_RIGHT, HID_GAP_MS),
         (KEY_A, HID_GAP_MS),
-        (KEY_A, HID_GAP_MS),
+        (KEY_A, HID_GAP_LAST_MS),
     ];
     let mut t = 0u128;
     for (btn, gap) in steps {
@@ -473,38 +539,29 @@ fn hid_save_buttons(ms: u128) -> u64 {
     0
 }
 
-fn hid_save_ms() -> u128 {
-    if crate::overrides::replay_save() {
-        HID_SAVE_MS
-    } else {
-        0
-    }
-}
-
-fn hid_vault_ms() -> u128 {
-    if crate::overrides::replay_save() {
-        HID_VAULT_MS
-    } else {
-        0
-    }
-}
-
-fn hid_buttons_for_pad(action_ms: u128, pad: u32, wrote: bool) -> Option<u64> {
-    let save_ms = hid_save_ms();
-    let vault_ms = hid_vault_ms();
+fn hid_buttons_for_pad(
+    action_ms: u128,
+    pad: u32,
+    wrote: bool,
+    kind: PadKind,
+    save_npad: Option<u32>,
+) -> Option<u64> {
+    let do_save = crate::overrides::replay_save() && save_npad.is_some();
+    let save_ms = if do_save { HID_SAVE_MS } else { 0 };
+    let vault_ms = if do_save { HID_VAULT_MS } else { 0 };
     let skip = crate::overrides::results_skip();
     if action_ms < save_ms {
-        if is_save_pad(pad) {
+        if is_save_pad(pad, save_npad) {
             Some(hid_save_buttons(action_ms))
         } else {
             Some(0)
         }
     } else {
         let after_save = action_ms - save_ms;
-        if crate::overrides::replay_save() && !wrote && after_save < vault_ms {
+        if do_save && !wrote && after_save < vault_ms {
             Some(0)
         } else if skip {
-            let exit_ms = if crate::overrides::replay_save() && !wrote {
+            let exit_ms = if do_save && !wrote {
                 after_save - vault_ms
             } else {
                 after_save
@@ -512,7 +569,7 @@ fn hid_buttons_for_pad(action_ms: u128, pad: u32, wrote: bool) -> Option<u64> {
             if exit_ms >= HID_EXIT_MS {
                 None
             } else {
-                Some(hid_exit_a(exit_ms))
+                Some(hid_exit_buttons(kind, exit_ms))
             }
         } else {
             None
@@ -549,8 +606,8 @@ fn note_npad_hit() {
     hid_info().hid_npad_hits.fetch_add(1, Ordering::Relaxed);
 }
 
-fn apply_mask_npads(state: *mut NpadHandheldState, count: i32, id: *const u32) {
-    let Some(buttons) = hid_mask_buttons(npad_id(id)) else {
+fn apply_mask_npads(state: *mut NpadHandheldState, count: i32, id: *const u32, kind: PadKind) {
+    let Some(buttons) = hid_mask_buttons(npad_id(id), kind) else {
         hid_info().hid_masking.store(false, Ordering::Relaxed);
         return;
     };
@@ -564,7 +621,7 @@ fn apply_mask_npads(state: *mut NpadHandheldState, count: i32, id: *const u32) {
 }
 
 fn apply_mask_gc(state: *mut NpadGcState, count: i32, id: *const u32) {
-    let Some(buttons) = hid_mask_buttons(npad_id(id)) else {
+    let Some(buttons) = hid_mask_buttons(npad_id(id), PadKind::Full) else {
         hid_info().hid_masking.store(false, Ordering::Relaxed);
         return;
     };
@@ -618,12 +675,12 @@ unsafe fn call_orig_states(idx: usize, state: *mut NpadHandheldState, count: i32
 unsafe extern "C" fn hook_state_hh(state: *mut NpadHandheldState, id: *const u32) {
     note_npad_hit();
     call_orig_state(0, state, id);
-    apply_mask_npads(state, 1, id);
+    apply_mask_npads(state, 1, id, PadKind::Full);
 }
 unsafe extern "C" fn hook_state_fk(state: *mut NpadHandheldState, id: *const u32) {
     note_npad_hit();
     call_orig_state(1, state, id);
-    apply_mask_npads(state, 1, id);
+    apply_mask_npads(state, 1, id, PadKind::Full);
 }
 unsafe extern "C" fn hook_state_gc(state: *mut NpadGcState, id: *const u32) {
     note_npad_hit();
@@ -637,28 +694,28 @@ unsafe extern "C" fn hook_state_gc(state: *mut NpadGcState, id: *const u32) {
 unsafe extern "C" fn hook_state_jd(state: *mut NpadHandheldState, id: *const u32) {
     note_npad_hit();
     call_orig_state(3, state, id);
-    apply_mask_npads(state, 1, id);
+    apply_mask_npads(state, 1, id, PadKind::Full);
 }
 unsafe extern "C" fn hook_state_jl(state: *mut NpadHandheldState, id: *const u32) {
     note_npad_hit();
     call_orig_state(4, state, id);
-    apply_mask_npads(state, 1, id);
+    apply_mask_npads(state, 1, id, PadKind::JoyLeft);
 }
 unsafe extern "C" fn hook_state_jr(state: *mut NpadHandheldState, id: *const u32) {
     note_npad_hit();
     call_orig_state(5, state, id);
-    apply_mask_npads(state, 1, id);
+    apply_mask_npads(state, 1, id, PadKind::JoyRight);
 }
 
 unsafe extern "C" fn hook_states_hh(state: *mut NpadHandheldState, count: i32, id: *const u32) {
     note_npad_hit();
     call_orig_states(0, state, count, id);
-    apply_mask_npads(state, count, id);
+    apply_mask_npads(state, count, id, PadKind::Full);
 }
 unsafe extern "C" fn hook_states_fk(state: *mut NpadHandheldState, count: i32, id: *const u32) {
     note_npad_hit();
     call_orig_states(1, state, count, id);
-    apply_mask_npads(state, count, id);
+    apply_mask_npads(state, count, id, PadKind::Full);
 }
 unsafe extern "C" fn hook_states_gc(state: *mut NpadGcState, count: i32, id: *const u32) {
     note_npad_hit();
@@ -672,17 +729,17 @@ unsafe extern "C" fn hook_states_gc(state: *mut NpadGcState, count: i32, id: *co
 unsafe extern "C" fn hook_states_jd(state: *mut NpadHandheldState, count: i32, id: *const u32) {
     note_npad_hit();
     call_orig_states(3, state, count, id);
-    apply_mask_npads(state, count, id);
+    apply_mask_npads(state, count, id, PadKind::Full);
 }
 unsafe extern "C" fn hook_states_jl(state: *mut NpadHandheldState, count: i32, id: *const u32) {
     note_npad_hit();
     call_orig_states(4, state, count, id);
-    apply_mask_npads(state, count, id);
+    apply_mask_npads(state, count, id, PadKind::JoyLeft);
 }
 unsafe extern "C" fn hook_states_jr(state: *mut NpadHandheldState, count: i32, id: *const u32) {
     note_npad_hit();
     call_orig_states(5, state, count, id);
-    apply_mask_npads(state, count, id);
+    apply_mask_npads(state, count, id, PadKind::JoyRight);
 }
 
 fn hook_abs(sym: &[u8], replace: *const c_void, orig: &AtomicPtr<()>) -> bool {
@@ -747,7 +804,7 @@ fn game_unfocused() -> bool {
     s == OE_FOCUS_OUT || s == OE_FOCUS_BG
 }
 
-fn hid_mask_buttons(pad: u32) -> Option<u64> {
+fn hid_mask_buttons(pad: u32, kind: PadKind) -> Option<u64> {
     if !crate::overrides::hid_enabled() {
         return None;
     }
@@ -786,24 +843,31 @@ fn hid_mask_buttons(pad: u32) -> Option<u64> {
     if elapsed < HID_ANIM_MS {
         if !st.hid_logged_wait {
             st.hid_logged_wait = true;
-            println!("[smush_info] replay auto-save: mute pads, wait 8s for results UI");
+            println!("[smush_info] replay auto-save: mute pads, wait 7.5s for results UI");
         }
         return Some(0);
     }
     if !st.hid_logged_start {
         st.hid_logged_start = true;
-        let save = crate::overrides::replay_save();
+        let save = crate::overrides::replay_save() && st.save_npad.is_some();
         let skip = crate::overrides::results_skip();
         if save && skip {
-            println!("[smush_info] replay auto-save: P1 A A Y Right A A, vault wait, then exit A");
+            println!(
+                "[smush_info] replay auto-save: pad {:?} A A Y Right A A, vault wait, then exit",
+                st.save_npad
+            );
         } else if save {
-            println!("[smush_info] replay auto-save: P1 A A Y Right A A, vault wait");
+            println!(
+                "[smush_info] replay auto-save: pad {:?} A A Y Right A A, vault wait",
+                st.save_npad
+            );
         } else {
-            println!("[smush_info] results skip: A all pads");
+            println!("[smush_info] results skip: confirm all pads (A / SR / dpad)");
         }
     }
     let action_ms = elapsed - HID_ANIM_MS;
-    match hid_buttons_for_pad(action_ms, pad, st.hid_got_write()) {
+    let save_npad = st.save_npad;
+    match hid_buttons_for_pad(action_ms, pad, st.hid_got_write(), kind, save_npad) {
         Some(buttons) => Some(buttons),
         None => {
             st.hid_released = true;
