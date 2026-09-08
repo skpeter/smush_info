@@ -171,6 +171,7 @@ pub(crate) static GAME_INFO: Info = Info::new();
 
 const MATCH_TICK_MS: u64 = 16;
 const SNAPSHOT_COOLDOWN_TICKS: u64 = 120_000 / MATCH_TICK_MS;
+const DUMP_RETRY_TICKS: u64 = 45;
 
 #[derive(Clone, Copy)]
 struct PlayerSnap {
@@ -332,6 +333,7 @@ struct MatchTickState {
     prev_game_over: bool,
     prev_is_match: bool,
     saw_match: bool,
+    dumped_this_match: bool,
     ticks_since_dump: u64,
 }
 
@@ -339,6 +341,7 @@ static mut MATCH_TICK: MatchTickState = MatchTickState {
     prev_game_over: false,
     prev_is_match: false,
     saw_match: false,
+    dumped_this_match: false,
     ticks_since_dump: SNAPSHOT_COOLDOWN_TICKS,
 };
 
@@ -374,6 +377,8 @@ unsafe fn update_match_state(state: &mut MatchTickState) {
 
     if is_match && !state.prev_is_match {
         replay_dump::on_match_rising();
+        state.dumped_this_match = false;
+        state.ticks_since_dump = DUMP_RETRY_TICKS;
     }
     if is_match {
         GAME_INFO.remaining_frames.store(get_remaining_time_as_frame(), Ordering::SeqCst);
@@ -382,12 +387,25 @@ unsafe fn update_match_state(state: &mut MatchTickState) {
     }
 
     let game_over = state.saw_match && is_game_over(is_results, is_match);
-    if game_over && !state.prev_game_over && state.ticks_since_dump >= SNAPSHOT_COOLDOWN_TICKS {
+    // Stats winner is flaky (timeout, FFA, IC, sudden death). is_results is the
+    // real fallback. Do not require saw_match: match→results gap clears it, HID
+    // still runs, dump would miss. Cooldown is per-match, not 2min of fighter ticks.
+    let want_dump = !state.dumped_this_match
+        && (is_results || (game_over && !state.prev_game_over))
+        && state.ticks_since_dump >= DUMP_RETRY_TICKS;
+    if want_dump {
         if is_results {
             GAME_INFO.is_results_screen.store(true, Ordering::SeqCst);
         }
         let dump: fn() -> bool = dump_game_info_snapshot;
         if std::hint::black_box(dump)() {
+            state.dumped_this_match = true;
+            state.ticks_since_dump = 0;
+            println!(
+                "[smush_info] snapshot dump results={} stats_over={}",
+                is_results, game_over
+            );
+        } else {
             state.ticks_since_dump = 0;
         }
     }
