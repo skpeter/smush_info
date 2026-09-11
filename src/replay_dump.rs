@@ -6,7 +6,7 @@ use smash::app::{self, lua_bind::FighterManager};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::Mutex;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 const CAP_BYTES: usize = 8 * 1024 * 1024;
 const PROBE_MAX: usize = 50;
@@ -72,14 +72,6 @@ impl DumpState {
             || matches!(self.pair, Pair::Pending { .. } | Pair::Orphan { .. })
     }
 
-    fn hid_got_write(&self) -> bool {
-        match &self.pair {
-            Pair::Pending { wrote_bin: true, .. } => true,
-            Pair::Orphan { files } => files.iter().any(|f| magic_score(&f.buf) > 0),
-            _ => false,
-        }
-    }
-
     fn wants_hid_mask(&self, live_results: bool) -> bool {
         live_results && !self.hid_released
     }
@@ -119,11 +111,28 @@ impl DumpState {
         if gap.as_millis() < HID_SUSPEND_GAP_MS {
             return;
         }
-        if let Some(began) = self.hid_began {
-            self.hid_began = Some(began + gap);
+        let Some(began) = self.hid_began else {
+            return;
+        };
+        let elapsed_before = last.saturating_duration_since(began).as_millis();
+        if elapsed_before < HID_ANIM_MS {
+            self.hid_began = Some(began.checked_add(gap).unwrap_or(began));
             println!(
-                "[smush_info] replay auto-save: paused {}ms (HOME/suspend)",
+                "[smush_info] replay auto-save: paused {}ms anim wait (HOME/suspend)",
                 gap.as_millis()
+            );
+            return;
+        }
+        let do_save = crate::overrides::replay_save() && self.save_npad.is_some();
+        let save_end = HID_ANIM_MS + if do_save { HID_SAVE_MS } else { 0 };
+        if do_save && elapsed_before < save_end {
+            let target = HID_ANIM_MS.saturating_sub(HID_SAVE_RESUME_PAD_MS);
+            let pad = Duration::from_millis(target as u64);
+            self.hid_began = Some(now.checked_sub(pad).unwrap_or(now));
+            self.hid_logged_start = false;
+            println!(
+                "[smush_info] replay auto-save: HOME during save seq, restart +{}ms",
+                HID_SAVE_RESUME_PAD_MS
             );
         }
     }
@@ -265,7 +274,62 @@ fn emit_bin(stem: &str, cap: &Capture) -> bool {
         );
         return false;
     }
-    results_log::write_replay(stem, &cap.path, &cap.buf)
+    let ok = results_log::write_replay(stem, &cap.path, &cap.buf);
+    if ok {
+        delete_vault_after_export(&cap.path);
+    }
+    ok
+}
+
+fn vault_path_ok(path: &str) -> bool {
+    !path.is_empty()
+        && !path.contains("smush_info")
+        && path.contains("save_data/replay")
+}
+
+static DELETE_FILE: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
+
+fn delete_file_fn() -> Option<unsafe extern "C" fn(*const u8) -> u32> {
+    let mut p = DELETE_FILE.load(Ordering::Relaxed);
+    if p.is_null() {
+        let mut addr: usize = 0;
+        unsafe {
+            skyline::nn::ro::LookupSymbol(&mut addr, b"_ZN2nn2fs10DeleteFileEPKc\0".as_ptr());
+        }
+        if addr == 0 {
+            return None;
+        }
+        p = addr as *mut ();
+        DELETE_FILE.store(p, Ordering::Relaxed);
+    }
+    Some(unsafe { std::mem::transmute(p) })
+}
+
+fn delete_vault_after_export(path: &str) {
+    if !crate::overrides::replay_save() {
+        return;
+    }
+    if !vault_path_ok(path) {
+        println!("[smush_info] vault delete skip path={}", path);
+        return;
+    }
+    let Some(delete_file) = delete_file_fn() else {
+        println!("[smush_info] vault delete skip: DeleteFile symbol missing");
+        return;
+    };
+    let mut bytes = path.as_bytes().to_vec();
+    if bytes.last().copied() != Some(0) {
+        bytes.push(0);
+    }
+    let rc = unsafe { delete_file(bytes.as_ptr()) };
+    if rc == 0 {
+        println!("[smush_info] vault deleted {}", path);
+    } else {
+        println!(
+            "[smush_info] vault delete failed {} result={}",
+            path, rc
+        );
+    }
 }
 
 fn pick_best(files: &[Capture]) -> Option<usize> {
@@ -464,12 +528,10 @@ const HID_SUSPEND_GAP_MS: u128 = 1000;
 const OE_FOCUS_OUT: i32 = 2;
 const OE_FOCUS_BG: i32 = 3;
 const HID_PULSE_MS: u128 = 100;
-const HID_GAP_MS: u128 = 170;
-const HID_GAP_LAST_MS: u128 = 250;
-const HID_VAULT_MS: u128 = 2000;
+const HID_GAP_MS: u128 = 340;
+const HID_SAVE_RESUME_PAD_MS: u128 = 1000;
 const HID_EXIT_MS: u128 = 8000;
-const HID_SAVE_MS: u128 =
-    (HID_PULSE_MS + HID_GAP_MS) * 5 + (HID_PULSE_MS + HID_GAP_LAST_MS);
+const HID_SAVE_MS: u128 = (HID_PULSE_MS + HID_GAP_MS) * 5;
 
 fn npad_id(id: *const u32) -> u32 {
     if id.is_null() {
@@ -521,13 +583,12 @@ fn hid_exit_buttons(kind: PadKind, ms: u128) -> u64 {
 }
 
 fn hid_save_buttons(ms: u128) -> u64 {
-    let steps: [(u64, u128); 6] = [
+    let steps: [(u64, u128); 5] = [
         (KEY_A, HID_GAP_MS),
         (KEY_A, HID_GAP_MS),
         (KEY_Y, HID_GAP_MS),
         (KEY_RIGHT, HID_GAP_MS),
         (KEY_A, HID_GAP_MS),
-        (KEY_A, HID_GAP_LAST_MS),
     ];
     let mut t = 0u128;
     for (btn, gap) in steps {
@@ -542,13 +603,11 @@ fn hid_save_buttons(ms: u128) -> u64 {
 fn hid_buttons_for_pad(
     action_ms: u128,
     pad: u32,
-    wrote: bool,
     kind: PadKind,
     save_npad: Option<u32>,
 ) -> Option<u64> {
     let do_save = crate::overrides::replay_save() && save_npad.is_some();
     let save_ms = if do_save { HID_SAVE_MS } else { 0 };
-    let vault_ms = if do_save { HID_VAULT_MS } else { 0 };
     let skip = crate::overrides::results_skip();
     if action_ms < save_ms {
         if is_save_pad(pad, save_npad) {
@@ -556,24 +615,15 @@ fn hid_buttons_for_pad(
         } else {
             Some(0)
         }
-    } else {
-        let after_save = action_ms - save_ms;
-        if do_save && !wrote && after_save < vault_ms {
-            Some(0)
-        } else if skip {
-            let exit_ms = if do_save && !wrote {
-                after_save - vault_ms
-            } else {
-                after_save
-            };
-            if exit_ms >= HID_EXIT_MS {
-                None
-            } else {
-                Some(hid_exit_buttons(kind, exit_ms))
-            }
-        } else {
+    } else if skip {
+        let exit_ms = action_ms - save_ms;
+        if exit_ms >= HID_EXIT_MS {
             None
+        } else {
+            Some(hid_exit_buttons(kind, exit_ms))
         }
+    } else {
+        None
     }
 }
 
@@ -853,12 +903,12 @@ fn hid_mask_buttons(pad: u32, kind: PadKind) -> Option<u64> {
         let skip = crate::overrides::results_skip();
         if save && skip {
             println!(
-                "[smush_info] replay auto-save: pad {:?} A A Y Right A A, vault wait, then exit",
+                "[smush_info] replay auto-save: pad {:?} A A Y Right A, then exit",
                 st.save_npad
             );
         } else if save {
             println!(
-                "[smush_info] replay auto-save: pad {:?} A A Y Right A A, vault wait",
+                "[smush_info] replay auto-save: pad {:?} A A Y Right A",
                 st.save_npad
             );
         } else {
@@ -867,7 +917,7 @@ fn hid_mask_buttons(pad: u32, kind: PadKind) -> Option<u64> {
     }
     let action_ms = elapsed - HID_ANIM_MS;
     let save_npad = st.save_npad;
-    match hid_buttons_for_pad(action_ms, pad, st.hid_got_write(), kind, save_npad) {
+    match hid_buttons_for_pad(action_ms, pad, kind, save_npad) {
         Some(buttons) => Some(buttons),
         None => {
             st.hid_released = true;
