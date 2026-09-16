@@ -401,10 +401,6 @@ unsafe fn update_match_state(state: &mut MatchTickState) {
         if std::hint::black_box(dump)() {
             state.dumped_this_match = true;
             state.ticks_since_dump = 0;
-            println!(
-                "[smush_info] snapshot dump results={} stats_over={}",
-                is_results, game_over
-            );
         } else {
             state.ticks_since_dump = 0;
         }
@@ -641,7 +637,7 @@ static OFFSET3_SEARCH_CODE: &[u8] = &[ //exact
                             //.text:00000071000D7188                 B.EQ            loc_71000D71B4
 ];
 
-fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+pub(crate) fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|window| window == needle)
 }
 

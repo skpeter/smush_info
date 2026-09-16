@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 const DIR: &str = "sd:/smush_info";
+const REPLAY_DIR: &str = "sd:/ultimate/smush_info/replays";
 const MAX_MATCHES: usize = 100;
 
 lazy_static::lazy_static! {
@@ -51,13 +52,13 @@ pub(crate) fn timestamp_stem() -> Option<String> {
     }
 }
 
-fn ensure_dir() -> bool {
-    let dir = Path::new(DIR);
+fn ensure_dir(path: &str) -> bool {
+    let dir = Path::new(path);
     if dir.is_dir() {
         return true;
     }
     if let Err(e) = fs::create_dir_all(dir) {
-        println!("[smush_info] failed to create {}: {}", DIR, e);
+        println!("[smush_info] failed to create {}: {}", path, e);
         return false;
     }
     true
@@ -122,25 +123,21 @@ fn remove_match(stem: &str) {
             }
         }
     }
-    let dir = PathBuf::from(DIR).join(stem);
-    if dir.is_dir() {
-        if let Err(e) = fs::remove_dir_all(&dir) {
-            println!("[smush_info] failed to prune {:?}: {}", dir, e);
+    for base in [DIR, REPLAY_DIR] {
+        let dir = PathBuf::from(base).join(stem);
+        if dir.is_dir() {
+            if let Err(e) = fs::remove_dir_all(&dir) {
+                println!("[smush_info] failed to prune {:?}: {}", dir, e);
+            }
         }
     }
 }
 
-#[inline(never)]
-fn prune_oldest(keep_stem: &str) {
-    let entries = match fs::read_dir(DIR) {
+fn collect_stems(dir: &str, stems: &mut Vec<String>) {
+    let entries = match fs::read_dir(dir) {
         Ok(it) => it,
-        Err(e) => {
-            println!("[smush_info] failed to list {}: {}", DIR, e);
-            return;
-        }
+        Err(_) => return,
     };
-
-    let mut stems: Vec<String> = Vec::new();
     for entry in entries {
         let entry = match entry {
             Ok(e) => e,
@@ -156,7 +153,13 @@ fn prune_oldest(keep_stem: &str) {
             }
         }
     }
+}
 
+#[inline(never)]
+fn prune_oldest(keep_stem: &str) {
+    let mut stems: Vec<String> = Vec::new();
+    collect_stems(DIR, &mut stems);
+    collect_stems(REPLAY_DIR, &mut stems);
     stems.sort();
     while stems.len() > MAX_MATCHES {
         let oldest = match stems.iter().find(|s| s.as_str() != keep_stem) {
@@ -171,7 +174,7 @@ fn prune_oldest(keep_stem: &str) {
 #[inline(never)]
 pub fn write_snapshot(json: &[u8]) -> Option<String> {
     let _g = dir_guard();
-    if !ensure_dir() {
+    if !ensure_dir(DIR) {
         return None;
     }
     let stem = timestamp_stem()?;
@@ -190,11 +193,11 @@ pub fn write_replay(stem: &str, vault_path: &str, data: &[u8]) -> bool {
         return false;
     }
     let _g = dir_guard();
-    if !ensure_dir() {
+    if !ensure_dir(REPLAY_DIR) {
         return false;
     }
     let name = native_filename(vault_path).unwrap_or_else(|| "replay.bin".to_string());
-    let dir = Path::new(DIR).join(stem);
+    let dir = Path::new(REPLAY_DIR).join(stem);
     if let Err(e) = fs::create_dir_all(&dir) {
         println!("[smush_info] failed to create {:?}: {}", dir, e);
         return false;

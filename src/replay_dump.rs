@@ -3,13 +3,12 @@ use skyline::hooks::A64HookFunction;
 use skyline::libc::{c_char, c_void};
 use skyline::nn::hid::{NpadGcState, NpadHandheldState};
 use smash::app::{self, lua_bind::FighterManager};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 const CAP_BYTES: usize = 8 * 1024 * 1024;
-const PROBE_MAX: usize = 50;
 const REPLAY_UTF16: &[u8] = &[b'R', 0, b'e', 0, b'p', 0, b'l', 0, b'a', 0, b'y', 0];
 const WRITE_BIT: i32 = nnsdk::fs::OpenMode_OpenMode_Write as i32;
 
@@ -32,20 +31,32 @@ enum Pair {
     },
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HidPhase {
+    Anim,
+    Save,
+    DumpWait,
+    Back,
+    Skip,
+    Done,
+}
+
 struct DumpState {
     captures: HashMap<u64, Capture>,
     pair: Pair,
     path_confirmed: bool,
-    probe_unique: HashSet<String>,
     results: bool,
     hid_began: Option<Instant>,
     last_hid_poll: Option<Instant>,
     hid_released: bool,
-    hid_logged_wait: bool,
-    hid_logged_start: bool,
     hid_session: bool,
     hid_unfocused: bool,
     save_npad: Option<u32>,
+    hid_phase: HidPhase,
+    phase_began: Option<Instant>,
+    save_attempts: u8,
+    logged_live_drop: bool,
+    logged_wait_write: bool,
 }
 
 impl DumpState {
@@ -54,17 +65,29 @@ impl DumpState {
             captures: HashMap::new(),
             pair: Pair::Idle,
             path_confirmed: false,
-            probe_unique: HashSet::new(),
             results: false,
             hid_began: None,
             last_hid_poll: None,
             hid_released: false,
-            hid_logged_wait: false,
-            hid_logged_start: false,
             hid_session: false,
             hid_unfocused: false,
             save_npad: None,
+            hid_phase: HidPhase::Anim,
+            phase_began: None,
+            save_attempts: 0,
+            logged_live_drop: false,
+            logged_wait_write: false,
         }
+    }
+
+    fn dump_ok(&self) -> bool {
+        matches!(
+            self.pair,
+            Pair::Pending {
+                wrote_bin: true,
+                ..
+            }
+        )
     }
 
     fn probe_window(&self) -> bool {
@@ -72,19 +95,22 @@ impl DumpState {
             || matches!(self.pair, Pair::Pending { .. } | Pair::Orphan { .. })
     }
 
-    fn wants_hid_mask(&self, live_results: bool) -> bool {
-        live_results && !self.hid_released
+    fn wants_hid_mask(&self) -> bool {
+        self.hid_session && !self.hid_released
     }
 
     fn reset_hid(&mut self) {
         self.hid_began = None;
         self.last_hid_poll = None;
         self.hid_released = false;
-        self.hid_logged_wait = false;
-        self.hid_logged_start = false;
         self.hid_session = false;
         self.hid_unfocused = false;
         self.save_npad = None;
+        self.hid_phase = HidPhase::Anim;
+        self.phase_began = None;
+        self.save_attempts = 0;
+        self.logged_live_drop = false;
+        self.logged_wait_write = false;
     }
 
     fn begin_hid_session(&mut self) {
@@ -94,13 +120,27 @@ impl DumpState {
         self.reset_hid();
         self.hid_session = true;
         self.save_npad = pick_save_npad();
-        println!(
-            "[smush_info] replay auto-save: save pad id={:?}",
-            self.save_npad
-        );
         let now = Instant::now();
         self.hid_began = Some(now);
         self.last_hid_poll = Some(now);
+        self.phase_began = Some(now);
+        self.hid_phase = HidPhase::Anim;
+        self.save_attempts = 0;
+    }
+
+    fn set_phase(&mut self, phase: HidPhase, now: Instant) {
+        if phase != HidPhase::DumpWait {
+            self.logged_wait_write = false;
+        }
+        self.hid_phase = phase;
+        self.phase_began = Some(now);
+    }
+
+    fn pause_phase_clock(&mut self, gap: std::time::Duration) {
+        let Some(phase_t) = self.phase_began else {
+            return;
+        };
+        self.phase_began = Some(phase_t.checked_add(gap).unwrap_or(phase_t));
     }
 
     fn absorb_suspend_gap(&mut self, now: Instant) {
@@ -111,30 +151,9 @@ impl DumpState {
         if gap.as_millis() < HID_SUSPEND_GAP_MS {
             return;
         }
-        let Some(began) = self.hid_began else {
-            return;
-        };
-        let elapsed_before = last.saturating_duration_since(began).as_millis();
-        if elapsed_before < HID_ANIM_MS {
-            self.hid_began = Some(began.checked_add(gap).unwrap_or(began));
-            println!(
-                "[smush_info] replay auto-save: paused {}ms anim wait (HOME/suspend)",
-                gap.as_millis()
-            );
-            return;
-        }
-        let do_save = crate::overrides::replay_save() && self.save_npad.is_some();
-        let save_end = HID_ANIM_MS + if do_save { HID_SAVE_MS } else { 0 };
-        if do_save && elapsed_before < save_end {
-            let target = HID_ANIM_MS.saturating_sub(HID_SAVE_RESUME_PAD_MS);
-            let pad = Duration::from_millis(target as u64);
-            self.hid_began = Some(now.checked_sub(pad).unwrap_or(now));
-            self.hid_logged_start = false;
-            println!(
-                "[smush_info] replay auto-save: HOME during save seq, restart +{}ms",
-                HID_SAVE_RESUME_PAD_MS
-            );
-        }
+        // Hitch or save UI can pause pad polls. Hold the button clock;
+        // replaying A A Y on a half-open dialog cancels it.
+        self.pause_phase_clock(gap);
     }
 }
 
@@ -193,12 +212,8 @@ fn maybe_probe(st: &mut DumpState, path: &str, mode: i32) {
     if !(path.starts_with("save:") || path.contains("save:/") || path.contains("save:")) {
         return;
     }
-    if st.probe_unique.len() < PROBE_MAX && st.probe_unique.insert(path.to_string()) {
-        println!("[smush_info] fs open mode={} path={}", mode, path);
-    }
     if path.contains("save_data/replay") {
         st.path_confirmed = true;
-        println!("[smush_info] replay path confirmed: {}", path);
     }
 }
 
@@ -236,42 +251,11 @@ fn apply_set_size(cap: &mut Capture, new_size: i64) {
     }
 }
 
-fn game_version() -> String {
-    let mut ver = nnsdk::oe::DisplayVersion { name: [0; 16] };
-    unsafe {
-        nnsdk::oe::GetDisplayVersion(&mut ver);
-    }
-    let n = ver.name.iter().position(|&b| b == 0).unwrap_or(ver.name.len());
-    String::from_utf8_lossy(&ver.name[..n]).into_owned()
-}
-
-fn log_probe(buf: &[u8], stem: &str, truncated: bool) {
-    println!(
-        "[smush_info] replay dump {} bytes={} truncated={} replay_utf16={} fram={} version={}",
-        stem,
-        buf.len(),
-        truncated,
-        has_utf16_replay(buf),
-        has_fram(buf),
-        game_version()
-    );
-}
-
 fn emit_bin(stem: &str, cap: &Capture) -> bool {
-    log_probe(&cap.buf, stem, cap.truncated);
     if cap.truncated {
-        println!(
-            "[smush_info] replay dump skip {}: truncated (need intact CloseFile blob)",
-            stem
-        );
         return false;
     }
     if magic_score(&cap.buf) < 2 {
-        println!(
-            "[smush_info] replay dump skip {}: missing UTF-16 Replay + FRAM header path={}",
-            stem,
-            cap.path
-        );
         return false;
     }
     let ok = results_log::write_replay(stem, &cap.path, &cap.buf);
@@ -310,11 +294,9 @@ fn delete_vault_after_export(path: &str) {
         return;
     }
     if !vault_path_ok(path) {
-        println!("[smush_info] vault delete skip path={}", path);
         return;
     }
     let Some(delete_file) = delete_file_fn() else {
-        println!("[smush_info] vault delete skip: DeleteFile symbol missing");
         return;
     };
     let mut bytes = path.as_bytes().to_vec();
@@ -322,14 +304,7 @@ fn delete_vault_after_export(path: &str) {
         bytes.push(0);
     }
     let rc = unsafe { delete_file(bytes.as_ptr()) };
-    if rc == 0 {
-        println!("[smush_info] vault deleted {}", path);
-    } else {
-        println!(
-            "[smush_info] vault delete failed {} result={}",
-            path, rc
-        );
-    }
+    let _ = rc;
 }
 
 fn pick_best(files: &[Capture]) -> Option<usize> {
@@ -367,15 +342,6 @@ pub fn on_json_written(stem: String) {
             Pair::Orphan { files } => {
                 let mut files = std::mem::take(files);
                 if let Some(i) = pick_best(&files) {
-                    for (j, f) in files.iter().enumerate() {
-                        if j != i {
-                            println!(
-                                "[smush_info] replay extra path={} bytes={}",
-                                f.path,
-                                f.buf.len()
-                            );
-                        }
-                    }
                     let cap = files.swap_remove(i);
                     let magic = magic_score(&cap.buf);
                     let len = cap.buf.len();
@@ -416,15 +382,6 @@ pub fn on_json_written(stem: String) {
 #[inline(never)]
 pub fn on_match_rising() {
     let mut st = lock_state();
-    match &st.pair {
-        Pair::Pending { stem, wrote_bin, .. } if !wrote_bin => {
-            println!("[smush_info] replay dump missed for {}", stem);
-        }
-        Pair::Orphan { .. } => {
-            println!("[smush_info] replay dump missed (orphan, no json)");
-        }
-        _ => {}
-    }
     st.pair = Pair::Idle;
     st.results = false;
     st.reset_hid();
@@ -466,13 +423,7 @@ fn finish_close(cap: Capture) {
                 let magic = magic_score(&cap.buf);
                 let len = cap.buf.len();
                 let better = is_better(magic, len, *best_magic, *best_len);
-                if *wrote_bin && !better {
-                    println!(
-                        "[smush_info] replay extra path={} bytes={}",
-                        cap.path,
-                        cap.buf.len()
-                    );
-                } else {
+                if !(*wrote_bin && !better) {
                     *best_magic = magic;
                     *best_len = len;
                     emit = Some((stem.clone(), cap));
@@ -481,7 +432,6 @@ fn finish_close(cap: Capture) {
         }
     }
     if let Some((stem, cap)) = emit {
-        let truncated = cap.truncated;
         let ok = emit_bin(&stem, &cap);
         if ok {
             let mut st = lock_state();
@@ -493,12 +443,6 @@ fn finish_close(cap: Capture) {
             {
                 if s == &stem {
                     *wrote_bin = true;
-                    if truncated {
-                        println!(
-                            "[smush_info] replay dump truncated {} cap=8MiB",
-                            s
-                        );
-                    }
                 }
             }
         }
@@ -529,9 +473,22 @@ const OE_FOCUS_OUT: i32 = 2;
 const OE_FOCUS_BG: i32 = 3;
 const HID_PULSE_MS: u128 = 100;
 const HID_GAP_MS: u128 = 340;
-const HID_SAVE_RESUME_PAD_MS: u128 = 1000;
 const HID_EXIT_MS: u128 = 8000;
 const HID_SAVE_MS: u128 = (HID_PULSE_MS + HID_GAP_MS) * 5;
+const HID_DUMP_WAIT_MS: u128 = 6000;
+const HID_BACK_MS: u128 = HID_PULSE_MS + HID_GAP_MS * 2;
+const HID_MAX_SAVE_ATTEMPTS: u8 = 3;
+
+fn hid_phase_name(phase: HidPhase) -> &'static str {
+    match phase {
+        HidPhase::Anim => "anim",
+        HidPhase::Save => "save",
+        HidPhase::DumpWait => "dump_wait",
+        HidPhase::Back => "back",
+        HidPhase::Skip => "skip",
+        HidPhase::Done => "done",
+    }
+}
 
 fn npad_id(id: *const u32) -> u32 {
     if id.is_null() {
@@ -600,30 +557,45 @@ fn hid_save_buttons(ms: u128) -> u64 {
     0
 }
 
+fn hid_back_buttons(ms: u128) -> u64 {
+    if ms < HID_PULSE_MS {
+        KEY_B
+    } else {
+        0
+    }
+}
+
 fn hid_buttons_for_pad(
-    action_ms: u128,
+    phase: HidPhase,
+    phase_ms: u128,
     pad: u32,
     kind: PadKind,
     save_npad: Option<u32>,
 ) -> Option<u64> {
-    let do_save = crate::overrides::replay_save() && save_npad.is_some();
-    let save_ms = if do_save { HID_SAVE_MS } else { 0 };
-    let skip = crate::overrides::results_skip();
-    if action_ms < save_ms {
-        if is_save_pad(pad, save_npad) {
-            Some(hid_save_buttons(action_ms))
-        } else {
-            Some(0)
+    match phase {
+        HidPhase::Anim | HidPhase::DumpWait => Some(0),
+        HidPhase::Save => {
+            if is_save_pad(pad, save_npad) {
+                Some(hid_save_buttons(phase_ms))
+            } else {
+                Some(0)
+            }
         }
-    } else if skip {
-        let exit_ms = action_ms - save_ms;
-        if exit_ms >= HID_EXIT_MS {
-            None
-        } else {
-            Some(hid_exit_buttons(kind, exit_ms))
+        HidPhase::Back => {
+            if is_save_pad(pad, save_npad) {
+                Some(hid_back_buttons(phase_ms))
+            } else {
+                Some(0)
+            }
         }
-    } else {
-        None
+        HidPhase::Skip => {
+            if crate::overrides::results_skip() {
+                Some(hid_exit_buttons(kind, phase_ms))
+            } else {
+                None
+            }
+        }
+        HidPhase::Done => None,
     }
 }
 
@@ -835,7 +807,6 @@ fn install_npad_abs_hooks() {
         }
     }
     hid_info().hid_hooks.store(n, Ordering::SeqCst);
-    println!("[smush_info] replay auto-save HID abs hooks {}/12", n);
 }
 
 unsafe fn live_is_results() -> bool {
@@ -861,7 +832,18 @@ fn hid_mask_buttons(pad: u32, kind: PadKind) -> Option<u64> {
     let live = unsafe { live_is_results() };
     let mut st = lock_state();
     if live {
+        st.logged_live_drop = false;
         st.begin_hid_session();
+    } else if st.wants_hid_mask() {
+        // Save Yes dialog often clears is_result_mode. Aborting here
+        // drops the seq mid-press and leaves results with no skip.
+        if !st.logged_live_drop {
+            st.logged_live_drop = true;
+            println!(
+                "[smush_info] hid: is_result_mode false during {}, keep seq",
+                hid_phase_name(st.hid_phase)
+            );
+        }
     } else {
         st.hid_session = false;
         st.last_hid_poll = None;
@@ -871,57 +853,117 @@ fn hid_mask_buttons(pad: u32, kind: PadKind) -> Option<u64> {
     }
     let now = Instant::now();
     if game_unfocused() {
-        if !st.hid_unfocused {
-            st.hid_unfocused = true;
-            println!("[smush_info] replay auto-save: unfocused, pause wait");
+        if let (Some(last), Some(phase_t)) = (st.last_hid_poll, st.phase_began) {
+            let gap = now.saturating_duration_since(last);
+            st.phase_began = Some(phase_t.checked_add(gap).unwrap_or(phase_t));
         }
+        st.last_hid_poll = Some(now);
+        st.hid_unfocused = true;
         return Some(0);
     }
     if st.hid_unfocused {
         st.hid_unfocused = false;
+        if matches!(
+            st.hid_phase,
+            HidPhase::Save | HidPhase::DumpWait | HidPhase::Back
+        ) {
+            println!(
+                "[smush_info] hid: HOME resume during {}, B then retry save",
+                hid_phase_name(st.hid_phase)
+            );
+            st.set_phase(HidPhase::Back, now);
+        }
     }
     st.absorb_suspend_gap(now);
     st.last_hid_poll = Some(now);
     let elapsed = st
         .hid_began
-        .map(|t| Instant::now().saturating_duration_since(t).as_millis())
+        .map(|t| now.saturating_duration_since(t).as_millis())
         .unwrap_or(0);
     hid_store_elapsed(elapsed);
-    if !st.wants_hid_mask(true) {
+    if !st.wants_hid_mask() {
         return None;
     }
-    if elapsed < HID_ANIM_MS {
-        if !st.hid_logged_wait {
-            st.hid_logged_wait = true;
-            println!("[smush_info] replay auto-save: mute pads, wait 7.5s for results UI");
-        }
-        return Some(0);
-    }
-    if !st.hid_logged_start {
-        st.hid_logged_start = true;
-        let save = crate::overrides::replay_save() && st.save_npad.is_some();
-        let skip = crate::overrides::results_skip();
-        if save && skip {
-            println!(
-                "[smush_info] replay auto-save: pad {:?} A A Y Right A, then exit",
-                st.save_npad
-            );
-        } else if save {
-            println!(
-                "[smush_info] replay auto-save: pad {:?} A A Y Right A",
-                st.save_npad
-            );
+    let mut phase_ms = st
+        .phase_began
+        .map(|t| now.saturating_duration_since(t).as_millis())
+        .unwrap_or(0);
+    let skip = crate::overrides::results_skip();
+    let dump_ok = st.dump_ok();
+
+    if st.hid_phase == HidPhase::Anim && phase_ms >= HID_ANIM_MS {
+        if crate::overrides::replay_save() {
+            if st.save_npad.is_none() {
+                st.save_npad = pick_save_npad();
+            }
+            if st.save_npad.is_some() {
+                st.set_phase(HidPhase::Save, now);
+            } else if skip {
+                println!("[smush_info] hid: no full pad, skip without save");
+                st.set_phase(HidPhase::Skip, now);
+            } else {
+                println!("[smush_info] hid: no full pad, pads live");
+                st.set_phase(HidPhase::Done, now);
+            }
+        } else if skip {
+            st.set_phase(HidPhase::Skip, now);
         } else {
-            println!("[smush_info] results skip: confirm all pads (A / SR / dpad)");
+            st.set_phase(HidPhase::Done, now);
+        }
+        phase_ms = 0;
+    }
+    if st.hid_phase == HidPhase::Save && dump_ok {
+        st.set_phase(if skip { HidPhase::Skip } else { HidPhase::Done }, now);
+        phase_ms = 0;
+    } else if st.hid_phase == HidPhase::Save && phase_ms >= HID_SAVE_MS {
+        st.set_phase(HidPhase::DumpWait, now);
+        phase_ms = 0;
+    }
+    if st.hid_phase == HidPhase::DumpWait && dump_ok {
+        st.set_phase(if skip { HidPhase::Skip } else { HidPhase::Done }, now);
+        phase_ms = 0;
+    } else if st.hid_phase == HidPhase::DumpWait && phase_ms >= HID_DUMP_WAIT_MS {
+        if !st.captures.is_empty() {
+            if !st.logged_wait_write {
+                st.logged_wait_write = true;
+                println!(
+                    "[smush_info] hid: dump wait, vault write still open ({})",
+                    st.captures.len()
+                );
+            }
+        } else if st.save_attempts + 1 >= HID_MAX_SAVE_ATTEMPTS {
+            println!(
+                "[smush_info] hid: no dump after {} attempts, pads live",
+                st.save_attempts + 1
+            );
+            st.set_phase(HidPhase::Done, now);
+            phase_ms = 0;
+        } else {
+            st.save_attempts = st.save_attempts.saturating_add(1);
+            println!(
+                "[smush_info] hid: no dump, B then retry {}/{}",
+                st.save_attempts + 1,
+                HID_MAX_SAVE_ATTEMPTS
+            );
+            st.set_phase(HidPhase::Back, now);
+            phase_ms = 0;
         }
     }
-    let action_ms = elapsed - HID_ANIM_MS;
+    if st.hid_phase == HidPhase::Back && phase_ms >= HID_BACK_MS {
+        st.set_phase(HidPhase::Save, now);
+        phase_ms = 0;
+    }
+    if st.hid_phase == HidPhase::Skip && phase_ms >= HID_EXIT_MS {
+        st.set_phase(HidPhase::Done, now);
+        phase_ms = 0;
+    }
+
     let save_npad = st.save_npad;
-    match hid_buttons_for_pad(action_ms, pad, kind, save_npad) {
+    let phase = st.hid_phase;
+    match hid_buttons_for_pad(phase, phase_ms, pad, kind, save_npad) {
         Some(buttons) => Some(buttons),
         None => {
             st.hid_released = true;
-            println!("[smush_info] replay auto-save hid done; pads live");
             None
         }
     }
@@ -935,13 +977,9 @@ pub fn install() {
             set_file_size_hook,
             close_file_hook
         );
-    } else {
-        println!("[smush_info] replay save disabled, skip FS dump hooks");
     }
     if crate::overrides::hid_enabled() {
         install_npad_abs_hooks();
-    } else {
-        println!("[smush_info] HID results seq disabled");
     }
 }
 
