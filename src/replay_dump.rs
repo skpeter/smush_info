@@ -4,7 +4,7 @@ use skyline::libc::{c_char, c_void};
 use skyline::nn::hid::{NpadGcState, NpadHandheldState};
 use smash::app::{self, lua_bind::FighterManager};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
 use std::sync::Mutex;
 use std::time::Instant;
 
@@ -34,6 +34,7 @@ enum Pair {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum HidPhase {
     Anim,
+    WaitPad,
     Save,
     DumpWait,
     Back,
@@ -52,11 +53,16 @@ struct DumpState {
     hid_session: bool,
     hid_unfocused: bool,
     save_npad: Option<u32>,
+    /// Polls of other pads since the game last polled `save_npad`. A pad
+    /// the game never polls cannot receive our taps: everyone else is muted
+    /// and nothing happens on screen.
+    save_pad_polls: u32,
     hid_phase: HidPhase,
     phase_began: Option<Instant>,
     save_attempts: u8,
     logged_live_drop: bool,
     logged_wait_write: bool,
+    logged_wait_pad: bool,
 }
 
 impl DumpState {
@@ -72,11 +78,13 @@ impl DumpState {
             hid_session: false,
             hid_unfocused: false,
             save_npad: None,
+            save_pad_polls: 0,
             hid_phase: HidPhase::Anim,
             phase_began: None,
             save_attempts: 0,
             logged_live_drop: false,
             logged_wait_write: false,
+            logged_wait_pad: false,
         }
     }
 
@@ -106,15 +114,23 @@ impl DumpState {
         self.hid_session = false;
         self.hid_unfocused = false;
         self.save_npad = None;
+        self.save_pad_polls = 0;
         self.hid_phase = HidPhase::Anim;
         self.phase_began = None;
         self.save_attempts = 0;
         self.logged_live_drop = false;
         self.logged_wait_write = false;
+        self.logged_wait_pad = false;
     }
 
     fn begin_hid_session(&mut self) {
-        if self.hid_session {
+        // One session per match. `hid_released` only clears on
+        // `on_match_rising`. Without this, one poll with is_result_mode
+        // false (save dialog, player poking the menu after pads went live)
+        // drops `hid_session`, the next live poll starts a fresh session,
+        // and results gets muted for another 7.5s + save attempts. The 60s
+        // cap is per session, so that loop never ends.
+        if self.hid_session || self.hid_released {
             return;
         }
         self.reset_hid();
@@ -462,11 +478,16 @@ const KEY_LEFT_SR: u64 = 1 << 25;
 const KEY_RIGHT_SL: u64 = 1 << 26;
 const KEY_RIGHT_SR: u64 = 1 << 27;
 const NPAD_HANDHELD: u32 = 0x20;
+const NPAD_ATTR_CONNECTED: u32 = 1;
 const STYLE_FULLKEY: u32 = 1 << 0;
 const STYLE_HANDHELD: u32 = 1 << 1;
 const STYLE_JOYDUAL: u32 = 1 << 2;
+const STYLE_JOYLEFT: u32 = 1 << 3;
+const STYLE_JOYRIGHT: u32 = 1 << 4;
 const STYLE_GC: u32 = 1 << 5;
 const STYLE_FULL: u32 = STYLE_FULLKEY | STYLE_HANDHELD | STYLE_JOYDUAL | STYLE_GC;
+const STYLE_SINGLE: u32 = STYLE_JOYLEFT | STYLE_JOYRIGHT;
+const STICK_MAX: i32 = 28000;
 const HID_ANIM_MS: u128 = 7500;
 const HID_SUSPEND_GAP_MS: u128 = 1000;
 const OE_FOCUS_OUT: i32 = 2;
@@ -478,10 +499,16 @@ const HID_SAVE_MS: u128 = (HID_PULSE_MS + HID_GAP_MS) * 5;
 const HID_DUMP_WAIT_MS: u128 = 6000;
 const HID_BACK_MS: u128 = HID_PULSE_MS + HID_GAP_MS * 2;
 const HID_MAX_SAVE_ATTEMPTS: u8 = 3;
+const HID_SESSION_MAX_MS: u128 = 60_000;
+/// Other-pad polls without a single poll of the save pad before we drop it.
+/// One other pad at 60Hz makes this ~1s; poll counts survive hitches and
+/// HOME pauses, wall clock does not.
+const HID_SAVE_PAD_SILENT_POLLS: u32 = 60;
 
 fn hid_phase_name(phase: HidPhase) -> &'static str {
     match phase {
         HidPhase::Anim => "anim",
+        HidPhase::WaitPad => "wait_pad",
         HidPhase::Save => "save",
         HidPhase::DumpWait => "dump_wait",
         HidPhase::Back => "back",
@@ -498,32 +525,180 @@ fn npad_id(id: *const u32) -> u32 {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum PadKind {
-    Full,
+    FullKey,
+    Handheld,
+    JoyDual,
+    Gc,
     JoyLeft,
     JoyRight,
 }
 
-fn npad_is_full(id: u32) -> bool {
-    let flags = unsafe { nnsdk::hid::GetNpadStyleSet(&id).flags };
-    flags & STYLE_FULL != 0
-}
-
-fn pick_save_npad() -> Option<u32> {
-    const IDS: [u32; 9] = [0, 1, 2, 3, 4, 5, 6, 7, NPAD_HANDHELD];
-    for id in IDS {
-        if npad_is_full(id) {
-            return Some(id);
+impl PadKind {
+    fn style_bit(self) -> u32 {
+        match self {
+            PadKind::FullKey => STYLE_FULLKEY,
+            PadKind::Handheld => STYLE_HANDHELD,
+            PadKind::JoyDual => STYLE_JOYDUAL,
+            PadKind::Gc => STYLE_GC,
+            PadKind::JoyLeft => STYLE_JOYLEFT,
+            PadKind::JoyRight => STYLE_JOYRIGHT,
         }
     }
-    None
+}
+
+/// Per-npad styles seen connected, from the states the game actually polls.
+/// Index 8 is the handheld npad. Each style keeps its own bit: a GC pad is
+/// polled as both Gc and FullKey, and every pad gets polled as JoyLeft /
+/// JoyRight too, so one style must never clear another.
+static PAD_STYLES: [AtomicU32; 9] = [
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+];
+
+fn pad_slot(id: u32) -> Option<usize> {
+    if id == NPAD_HANDHELD {
+        Some(8)
+    } else if id < 8 {
+        Some(id as usize)
+    } else {
+        None
+    }
+}
+
+fn slot_npad(slot: usize) -> u32 {
+    if slot == 8 {
+        NPAD_HANDHELD
+    } else {
+        slot as u32
+    }
+}
+
+fn note_polled_pad(id: u32, kind: PadKind, flags: u32) {
+    let Some(slot) = pad_slot(id) else {
+        return;
+    };
+    let bit = kind.style_bit();
+    if (flags & NPAD_ATTR_CONNECTED) != 0 {
+        PAD_STYLES[slot].fetch_or(bit, Ordering::Relaxed);
+    } else {
+        PAD_STYLES[slot].fetch_and(!bit, Ordering::Relaxed);
+    }
+}
+
+fn pad_styles(id: u32) -> u32 {
+    pad_slot(id).map_or(0, |slot| PAD_STYLES[slot].load(Ordering::Relaxed))
+}
+
+fn npad_can_save(id: u32) -> bool {
+    pad_styles(id) & (STYLE_FULL | STYLE_SINGLE) != 0
+}
+
+/// Pro / dual / handheld / GC can drive the whole menu. A lone Joy-Con only
+/// gets picked when nothing better is connected.
+fn pick_save_npad() -> Option<u32> {
+    let mut single = None;
+    for slot in 0..PAD_STYLES.len() {
+        let styles = PAD_STYLES[slot].load(Ordering::Relaxed);
+        if styles & STYLE_FULL != 0 {
+            return Some(slot_npad(slot));
+        }
+        if single.is_none() && styles & STYLE_SINGLE != 0 {
+            single = Some(slot_npad(slot));
+        }
+    }
+    single
+}
+
+fn style_names(styles: u32) -> String {
+    const NAMES: [(u32, &str); 6] = [
+        (STYLE_FULLKEY, "pro"),
+        (STYLE_HANDHELD, "handheld"),
+        (STYLE_JOYDUAL, "dual"),
+        (STYLE_JOYLEFT, "joyl"),
+        (STYLE_JOYRIGHT, "joyr"),
+        (STYLE_GC, "gc"),
+    ];
+    let mut out = String::new();
+    for (bit, name) in NAMES {
+        if styles & bit != 0 {
+            if !out.is_empty() {
+                out.push('|');
+            }
+            out.push_str(name);
+        }
+    }
+    if out.is_empty() {
+        out.push_str("none");
+    }
+    out
+}
+
+fn log_pad_inventory() {
+    for slot in 0..PAD_STYLES.len() {
+        let styles = PAD_STYLES[slot].load(Ordering::Relaxed);
+        if styles != 0 {
+            println!(
+                "[smush_info] hid: pad {:#x} styles {}",
+                slot_npad(slot),
+                style_names(styles)
+            );
+        }
+    }
+}
+
+/// Returns true when the save pad changed, so the caller can restart the
+/// tap sequence on the new pad instead of feeding it the tail end.
+fn refresh_save_npad(st: &mut DumpState) -> bool {
+    if let Some(id) = st.save_npad {
+        if st.save_pad_polls >= HID_SAVE_PAD_SILENT_POLLS {
+            // PAD_STYLES only clears a style when the game polls that id
+            // with that style and gets "not connected". A pad that left
+            // (unplugged, re-paired under another id) stops being polled
+            // at all, so its bits go stale and pick_save_npad keeps
+            // choosing a ghost. Forget it so the pick moves on.
+            println!(
+                "[smush_info] hid: save pad {:#x} not polled for {} polls, drop",
+                id, st.save_pad_polls
+            );
+            if let Some(slot) = pad_slot(id) {
+                PAD_STYLES[slot].store(0, Ordering::Relaxed);
+            }
+            st.save_npad = None;
+        } else if npad_can_save(id) {
+            return false;
+        }
+    }
+    let next = pick_save_npad();
+    st.save_pad_polls = 0;
+    if next == st.save_npad {
+        return false;
+    }
+    match next {
+        Some(id) => println!(
+            "[smush_info] hid: save pad {:?} -> {:#x} ({})",
+            st.save_npad,
+            id,
+            style_names(pad_styles(id))
+        ),
+        None => println!("[smush_info] hid: save pad {:?} -> none", st.save_npad),
+    }
+    st.save_npad = next;
+    true
 }
 
 fn is_save_pad(id: u32, save_npad: Option<u32>) -> bool {
     match save_npad {
         Some(s) => id == s,
-        None => id == 0 || id == NPAD_HANDHELD,
+        None => false,
     }
 }
 
@@ -533,10 +708,71 @@ fn hid_exit_buttons(kind: PadKind, ms: u128) -> u64 {
         return 0;
     }
     match kind {
-        PadKind::Full => KEY_A,
         PadKind::JoyLeft => KEY_A | KEY_LEFT | KEY_RIGHT | KEY_UP | KEY_DOWN | KEY_LEFT_SL | KEY_LEFT_SR,
         PadKind::JoyRight => KEY_A | KEY_B | KEY_X | KEY_Y | KEY_RIGHT_SL | KEY_RIGHT_SR,
+        _ => KEY_A,
     }
+}
+
+#[derive(Clone, Copy)]
+struct HidOut {
+    buttons: u64,
+    stick_x: i32,
+}
+
+impl HidOut {
+    const MUTE: Self = Self {
+        buttons: 0,
+        stick_x: 0,
+    };
+
+    fn buttons(buttons: u64) -> Self {
+        Self {
+            buttons,
+            stick_x: 0,
+        }
+    }
+}
+
+enum HidAction {
+    /// Overwrite this poll's state with our own buttons/stick.
+    Mask(HidOut),
+    /// Leave the poll alone: the player keeps full control.
+    Pass,
+    /// Leave the poll alone and end the session.
+    Release,
+}
+
+/// A lone Joy-Con held sideways has no d-pad, so menu Right comes from the
+/// stick. The left Joy-Con's four buttons sit where the right one's face
+/// buttons are: Right=A, Down=B, Up=X, Left=Y.
+fn hid_map_logical(kind: PadKind, logical: u64) -> HidOut {
+    if !matches!(kind, PadKind::JoyLeft | PadKind::JoyRight) {
+        return HidOut::buttons(logical);
+    }
+    if logical & KEY_RIGHT != 0 {
+        return HidOut {
+            buttons: 0,
+            stick_x: STICK_MAX,
+        };
+    }
+    if kind == PadKind::JoyRight {
+        return HidOut::buttons(logical);
+    }
+    let mut buttons = 0u64;
+    if logical & KEY_A != 0 {
+        buttons |= KEY_RIGHT;
+    }
+    if logical & KEY_B != 0 {
+        buttons |= KEY_DOWN;
+    }
+    if logical & KEY_X != 0 {
+        buttons |= KEY_UP;
+    }
+    if logical & KEY_Y != 0 {
+        buttons |= KEY_LEFT;
+    }
+    HidOut::buttons(buttons)
 }
 
 fn hid_save_buttons(ms: u128) -> u64 {
@@ -571,31 +807,33 @@ fn hid_buttons_for_pad(
     pad: u32,
     kind: PadKind,
     save_npad: Option<u32>,
-) -> Option<u64> {
+) -> HidAction {
     match phase {
-        HidPhase::Anim | HidPhase::DumpWait => Some(0),
+        HidPhase::Anim | HidPhase::DumpWait => HidAction::Mask(HidOut::MUTE),
+        // Nothing we can drive, so muting would only trap the players here.
+        HidPhase::WaitPad => HidAction::Pass,
         HidPhase::Save => {
             if is_save_pad(pad, save_npad) {
-                Some(hid_save_buttons(phase_ms))
+                HidAction::Mask(hid_map_logical(kind, hid_save_buttons(phase_ms)))
             } else {
-                Some(0)
+                HidAction::Mask(HidOut::MUTE)
             }
         }
         HidPhase::Back => {
             if is_save_pad(pad, save_npad) {
-                Some(hid_back_buttons(phase_ms))
+                HidAction::Mask(hid_map_logical(kind, hid_back_buttons(phase_ms)))
             } else {
-                Some(0)
+                HidAction::Mask(HidOut::MUTE)
             }
         }
         HidPhase::Skip => {
             if crate::overrides::results_skip() {
-                Some(hid_exit_buttons(kind, phase_ms))
+                HidAction::Mask(HidOut::buttons(hid_exit_buttons(kind, phase_ms)))
             } else {
-                None
+                HidAction::Release
             }
         }
-        HidPhase::Done => None,
+        HidPhase::Done => HidAction::Release,
     }
 }
 
@@ -609,14 +847,14 @@ fn hid_store_elapsed(ms: u128) {
         .store(ms.min(u128::from(u32::MAX)) as u32, Ordering::Relaxed);
 }
 
-unsafe fn mask_npad(state: *mut NpadHandheldState, buttons: u64) {
+unsafe fn mask_npad(state: *mut NpadHandheldState, out: HidOut) {
     if state.is_null() {
         return;
     }
-    (*state).Buttons = buttons;
-    (*state).LStickX = 0;
+    (*state).Buttons = out.buttons;
+    (*state).LStickX = out.stick_x;
     (*state).LStickY = 0;
-    (*state).RStickX = 0;
+    (*state).RStickX = out.stick_x;
     (*state).RStickY = 0;
 }
 
@@ -629,7 +867,11 @@ fn note_npad_hit() {
 }
 
 fn apply_mask_npads(state: *mut NpadHandheldState, count: i32, id: *const u32, kind: PadKind) {
-    let Some(buttons) = hid_mask_buttons(npad_id(id), kind) else {
+    let pad = npad_id(id);
+    if !state.is_null() {
+        note_polled_pad(pad, kind, unsafe { (*state).Flags });
+    }
+    let HidAction::Mask(out) = hid_mask_buttons(pad, kind) else {
         hid_info().hid_masking.store(false, Ordering::Relaxed);
         return;
     };
@@ -637,13 +879,17 @@ fn apply_mask_npads(state: *mut NpadHandheldState, count: i32, id: *const u32, k
     let n = hid_count(count);
     unsafe {
         for i in 0..n {
-            mask_npad(state.add(i), buttons);
+            mask_npad(state.add(i), out);
         }
     }
 }
 
 fn apply_mask_gc(state: *mut NpadGcState, count: i32, id: *const u32) {
-    let Some(buttons) = hid_mask_buttons(npad_id(id), PadKind::Full) else {
+    let pad = npad_id(id);
+    if !state.is_null() {
+        note_polled_pad(pad, PadKind::Gc, unsafe { (*state).Flags });
+    }
+    let HidAction::Mask(out) = hid_mask_buttons(pad, PadKind::Gc) else {
         hid_info().hid_masking.store(false, Ordering::Relaxed);
         return;
     };
@@ -652,7 +898,7 @@ fn apply_mask_gc(state: *mut NpadGcState, count: i32, id: *const u32) {
     unsafe {
         for i in 0..n {
             let p = state.add(i);
-            mask_npad(p as *mut NpadHandheldState, buttons);
+            mask_npad(p as *mut NpadHandheldState, out);
             (*p).LTrigger = 0;
             (*p).RTrigger = 0;
         }
@@ -697,12 +943,12 @@ unsafe fn call_orig_states(idx: usize, state: *mut NpadHandheldState, count: i32
 unsafe extern "C" fn hook_state_hh(state: *mut NpadHandheldState, id: *const u32) {
     note_npad_hit();
     call_orig_state(0, state, id);
-    apply_mask_npads(state, 1, id, PadKind::Full);
+    apply_mask_npads(state, 1, id, PadKind::Handheld);
 }
 unsafe extern "C" fn hook_state_fk(state: *mut NpadHandheldState, id: *const u32) {
     note_npad_hit();
     call_orig_state(1, state, id);
-    apply_mask_npads(state, 1, id, PadKind::Full);
+    apply_mask_npads(state, 1, id, PadKind::FullKey);
 }
 unsafe extern "C" fn hook_state_gc(state: *mut NpadGcState, id: *const u32) {
     note_npad_hit();
@@ -716,7 +962,7 @@ unsafe extern "C" fn hook_state_gc(state: *mut NpadGcState, id: *const u32) {
 unsafe extern "C" fn hook_state_jd(state: *mut NpadHandheldState, id: *const u32) {
     note_npad_hit();
     call_orig_state(3, state, id);
-    apply_mask_npads(state, 1, id, PadKind::Full);
+    apply_mask_npads(state, 1, id, PadKind::JoyDual);
 }
 unsafe extern "C" fn hook_state_jl(state: *mut NpadHandheldState, id: *const u32) {
     note_npad_hit();
@@ -732,12 +978,12 @@ unsafe extern "C" fn hook_state_jr(state: *mut NpadHandheldState, id: *const u32
 unsafe extern "C" fn hook_states_hh(state: *mut NpadHandheldState, count: i32, id: *const u32) {
     note_npad_hit();
     call_orig_states(0, state, count, id);
-    apply_mask_npads(state, count, id, PadKind::Full);
+    apply_mask_npads(state, count, id, PadKind::Handheld);
 }
 unsafe extern "C" fn hook_states_fk(state: *mut NpadHandheldState, count: i32, id: *const u32) {
     note_npad_hit();
     call_orig_states(1, state, count, id);
-    apply_mask_npads(state, count, id, PadKind::Full);
+    apply_mask_npads(state, count, id, PadKind::FullKey);
 }
 unsafe extern "C" fn hook_states_gc(state: *mut NpadGcState, count: i32, id: *const u32) {
     note_npad_hit();
@@ -751,7 +997,7 @@ unsafe extern "C" fn hook_states_gc(state: *mut NpadGcState, count: i32, id: *co
 unsafe extern "C" fn hook_states_jd(state: *mut NpadHandheldState, count: i32, id: *const u32) {
     note_npad_hit();
     call_orig_states(3, state, count, id);
-    apply_mask_npads(state, count, id, PadKind::Full);
+    apply_mask_npads(state, count, id, PadKind::JoyDual);
 }
 unsafe extern "C" fn hook_states_jl(state: *mut NpadHandheldState, count: i32, id: *const u32) {
     note_npad_hit();
@@ -807,6 +1053,7 @@ fn install_npad_abs_hooks() {
         }
     }
     hid_info().hid_hooks.store(n, Ordering::SeqCst);
+    println!("[smush_info] hid: {}/12 npad hooks installed", n);
 }
 
 unsafe fn live_is_results() -> bool {
@@ -825,9 +1072,9 @@ fn game_unfocused() -> bool {
     s == OE_FOCUS_OUT || s == OE_FOCUS_BG
 }
 
-fn hid_mask_buttons(pad: u32, kind: PadKind) -> Option<u64> {
+fn hid_mask_buttons(pad: u32, kind: PadKind) -> HidAction {
     if !crate::overrides::hid_enabled() {
-        return None;
+        return HidAction::Pass;
     }
     let live = unsafe { live_is_results() };
     let mut st = lock_state();
@@ -849,7 +1096,7 @@ fn hid_mask_buttons(pad: u32, kind: PadKind) -> Option<u64> {
         st.last_hid_poll = None;
         st.hid_unfocused = false;
         hid_store_elapsed(0);
-        return None;
+        return HidAction::Pass;
     }
     let now = Instant::now();
     if game_unfocused() {
@@ -859,7 +1106,7 @@ fn hid_mask_buttons(pad: u32, kind: PadKind) -> Option<u64> {
         }
         st.last_hid_poll = Some(now);
         st.hid_unfocused = true;
-        return Some(0);
+        return HidAction::Mask(HidOut::MUTE);
     }
     if st.hid_unfocused {
         st.hid_unfocused = false;
@@ -876,13 +1123,28 @@ fn hid_mask_buttons(pad: u32, kind: PadKind) -> Option<u64> {
     }
     st.absorb_suspend_gap(now);
     st.last_hid_poll = Some(now);
+    match st.save_npad {
+        Some(id) if id == pad => st.save_pad_polls = 0,
+        Some(_) => st.save_pad_polls = st.save_pad_polls.saturating_add(1),
+        None => {}
+    }
     let elapsed = st
         .hid_began
         .map(|t| now.saturating_duration_since(t).as_millis())
         .unwrap_or(0);
     hid_store_elapsed(elapsed);
     if !st.wants_hid_mask() {
-        return None;
+        return HidAction::Pass;
+    }
+    if elapsed >= HID_SESSION_MAX_MS && st.hid_phase != HidPhase::Done {
+        println!(
+            "[smush_info] hid: {}ms in {}, giving pads back",
+            elapsed,
+            hid_phase_name(st.hid_phase)
+        );
+        st.set_phase(HidPhase::Done, now);
+        st.hid_released = true;
+        return HidAction::Release;
     }
     let mut phase_ms = st
         .phase_began
@@ -890,20 +1152,49 @@ fn hid_mask_buttons(pad: u32, kind: PadKind) -> Option<u64> {
         .unwrap_or(0);
     let skip = crate::overrides::results_skip();
     let dump_ok = st.dump_ok();
+    if matches!(st.hid_phase, HidPhase::Save | HidPhase::Back | HidPhase::WaitPad) {
+        let switched = refresh_save_npad(&mut st);
+        if switched && st.hid_phase == HidPhase::Save && st.save_npad.is_some() {
+            // New pad gets the whole A A Y Right A, not the tail.
+            st.set_phase(HidPhase::Save, now);
+            phase_ms = 0;
+        }
+    }
+    if st.hid_phase == HidPhase::WaitPad
+        || (matches!(st.hid_phase, HidPhase::Save | HidPhase::Back) && st.save_npad.is_none())
+    {
+        if st.save_npad.is_some() {
+            st.logged_wait_pad = false;
+            st.set_phase(HidPhase::Save, now);
+            phase_ms = 0;
+        } else if st.hid_phase != HidPhase::WaitPad {
+            if !st.logged_wait_pad {
+                st.logged_wait_pad = true;
+                println!("[smush_info] hid: no controller, wait for one (pads live)");
+            }
+            st.set_phase(HidPhase::WaitPad, now);
+            phase_ms = 0;
+        }
+    }
 
     if st.hid_phase == HidPhase::Anim && phase_ms >= HID_ANIM_MS {
         if crate::overrides::replay_save() {
-            if st.save_npad.is_none() {
-                st.save_npad = pick_save_npad();
-            }
-            if st.save_npad.is_some() {
+            log_pad_inventory();
+            st.save_npad = pick_save_npad();
+            st.save_pad_polls = 0;
+            if let Some(id) = st.save_npad {
+                println!(
+                    "[smush_info] hid: save pad {:#x} ({})",
+                    id,
+                    style_names(pad_styles(id))
+                );
                 st.set_phase(HidPhase::Save, now);
-            } else if skip {
-                println!("[smush_info] hid: no full pad, skip without save");
-                st.set_phase(HidPhase::Skip, now);
             } else {
-                println!("[smush_info] hid: no full pad, pads live");
-                st.set_phase(HidPhase::Done, now);
+                if !st.logged_wait_pad {
+                    st.logged_wait_pad = true;
+                    println!("[smush_info] hid: no controller, wait for one (pads live)");
+                }
+                st.set_phase(HidPhase::WaitPad, now);
             }
         } else if skip {
             st.set_phase(HidPhase::Skip, now);
@@ -960,13 +1251,11 @@ fn hid_mask_buttons(pad: u32, kind: PadKind) -> Option<u64> {
 
     let save_npad = st.save_npad;
     let phase = st.hid_phase;
-    match hid_buttons_for_pad(phase, phase_ms, pad, kind, save_npad) {
-        Some(buttons) => Some(buttons),
-        None => {
-            st.hid_released = true;
-            None
-        }
+    let action = hid_buttons_for_pad(phase, phase_ms, pad, kind, save_npad);
+    if matches!(action, HidAction::Release) {
+        st.hid_released = true;
     }
+    action
 }
 
 pub fn install() {
@@ -979,7 +1268,10 @@ pub fn install() {
         );
     }
     if crate::overrides::hid_enabled() {
-        install_npad_abs_hooks();
+        std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_secs(3));
+            install_npad_abs_hooks();
+        });
     }
 }
 
