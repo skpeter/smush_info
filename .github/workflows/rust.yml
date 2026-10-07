@@ -2,6 +2,17 @@ name: Rust
 
 on:
   workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag, or SHA to build. Leave blank to build the branch selected above.
+        required: false
+        type: string
+  workflow_call:
+    inputs:
+      ref:
+        description: Branch, tag, or SHA to build. Leave blank to build the caller ref.
+        required: false
+        type: string
   push:
   pull_request:
   release:
@@ -17,6 +28,8 @@ jobs:
     permissions: write-all
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
       - uses: dtolnay/rust-toolchain@nightly
         with:
           target: x86_64-unknown-linux-gnu
@@ -34,10 +47,17 @@ jobs:
         run: RUSTFLAGS=-g cargo-skyline skyline build --release
       - name: Package SD zip
         run: bash scripts/package-sd.sh
+      - name: Name SD zip artifact
+        id: artifact
+        env:
+          BUILD_REF: ${{ inputs.ref || github.head_ref || github.ref_name }}
+        run: |
+          safe=$(printf '%s' "$BUILD_REF" | sed 's#[/:"<>|*?\\]#-#g')
+          echo "name=smush_info-sd-${safe}" >> "$GITHUB_OUTPUT"
       - name: Upload SD zip artifact
         uses: actions/upload-artifact@v4
         with:
-          name: smush_info-sd
+          name: ${{ steps.artifact.outputs.name }}
           path: smush_info-sd.zip
       - name: Upload SD zip to GitHub Release
         if: github.event_name == 'release'
