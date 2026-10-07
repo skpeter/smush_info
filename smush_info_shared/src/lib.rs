@@ -12,6 +12,8 @@ pub use atomic_arena_id::AtomicArenaId;
 mod atomic_name;
 pub use atomic_name::AtomicName;
 
+pub mod hid_route;
+
 #[derive(Serialize, Deserialize, Debug)]
 pub struct Info {
     pub arena_id: AtomicArenaId,

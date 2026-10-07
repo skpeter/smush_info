@@ -1,4 +1,9 @@
 use crate::results_log;
+use smush_info_shared::hid_route::{
+    observe_save_silence, restart_save_clock_on_retarget, takes_save_press, PadKind,
+    SAVE_PAD_SILENT_POLLS, STYLE_FULL, STYLE_FULLKEY, STYLE_GC, STYLE_HANDHELD, STYLE_JOYDUAL,
+    STYLE_JOYLEFT, STYLE_JOYRIGHT, STYLE_SINGLE,
+};
 use skyline::hooks::A64HookFunction;
 use skyline::libc::{c_char, c_void};
 use skyline::nn::hid::{NpadGcState, NpadHandheldState};
@@ -53,9 +58,9 @@ struct DumpState {
     hid_session: bool,
     hid_unfocused: bool,
     save_npad: Option<u32>,
-    /// Polls of other pads since the game last polled `save_npad`. A pad
-    /// the game never polls cannot receive our taps: everyone else is muted
-    /// and nothing happens on screen.
+    /// Primary-style polls of other pads since the game last polled `save_npad`.
+    /// A slot the game never polls is a ghost: its style bits stay set and the
+    /// pick keeps choosing it. Joy polls of a Pro do not count.
     save_pad_polls: u32,
     hid_phase: HidPhase,
     phase_began: Option<Instant>,
@@ -479,14 +484,6 @@ const KEY_RIGHT_SL: u64 = 1 << 26;
 const KEY_RIGHT_SR: u64 = 1 << 27;
 const NPAD_HANDHELD: u32 = 0x20;
 const NPAD_ATTR_CONNECTED: u32 = 1;
-const STYLE_FULLKEY: u32 = 1 << 0;
-const STYLE_HANDHELD: u32 = 1 << 1;
-const STYLE_JOYDUAL: u32 = 1 << 2;
-const STYLE_JOYLEFT: u32 = 1 << 3;
-const STYLE_JOYRIGHT: u32 = 1 << 4;
-const STYLE_GC: u32 = 1 << 5;
-const STYLE_FULL: u32 = STYLE_FULLKEY | STYLE_HANDHELD | STYLE_JOYDUAL | STYLE_GC;
-const STYLE_SINGLE: u32 = STYLE_JOYLEFT | STYLE_JOYRIGHT;
 const STICK_MAX: i32 = 28000;
 const HID_ANIM_MS: u128 = 7500;
 const HID_SUSPEND_GAP_MS: u128 = 1000;
@@ -500,10 +497,9 @@ const HID_DUMP_WAIT_MS: u128 = 6000;
 const HID_BACK_MS: u128 = HID_PULSE_MS + HID_GAP_MS * 2;
 const HID_MAX_SAVE_ATTEMPTS: u8 = 3;
 const HID_SESSION_MAX_MS: u128 = 60_000;
-/// Other-pad polls without a single poll of the save pad before we drop it.
-/// One other pad at 60Hz makes this ~1s; poll counts survive hitches and
-/// HOME pauses, wall clock does not.
-const HID_SAVE_PAD_SILENT_POLLS: u32 = 60;
+/// Other-pad primary-style polls with no poll of the save slot before we drop it.
+/// JoyLeft/JoyRight polls of a Pro do not count: one other Pro at 60Hz is ~1s.
+const HID_SAVE_PAD_SILENT_POLLS: u32 = SAVE_PAD_SILENT_POLLS;
 
 fn hid_phase_name(phase: HidPhase) -> &'static str {
     match phase {
@@ -522,29 +518,6 @@ fn npad_id(id: *const u32) -> u32 {
         0
     } else {
         unsafe { *id }
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum PadKind {
-    FullKey,
-    Handheld,
-    JoyDual,
-    Gc,
-    JoyLeft,
-    JoyRight,
-}
-
-impl PadKind {
-    fn style_bit(self) -> u32 {
-        match self {
-            PadKind::FullKey => STYLE_FULLKEY,
-            PadKind::Handheld => STYLE_HANDHELD,
-            PadKind::JoyDual => STYLE_JOYDUAL,
-            PadKind::Gc => STYLE_GC,
-            PadKind::JoyLeft => STYLE_JOYLEFT,
-            PadKind::JoyRight => STYLE_JOYRIGHT,
-        }
     }
 }
 
@@ -702,6 +675,36 @@ fn is_save_pad(id: u32, save_npad: Option<u32>) -> bool {
     }
 }
 
+fn any_full_pad() -> bool {
+    PAD_STYLES
+        .iter()
+        .any(|s| s.load(Ordering::Relaxed) & STYLE_FULL != 0)
+}
+
+fn full_pad_count() -> usize {
+    PAD_STYLES
+        .iter()
+        .filter(|s| s.load(Ordering::Relaxed) & STYLE_FULL != 0)
+        .count()
+}
+
+fn pad_gets_macro(pad: u32, kind: PadKind, save_npad: Option<u32>) -> bool {
+    takes_save_press(
+        pad_styles(pad),
+        kind,
+        any_full_pad(),
+        is_save_pad(pad, save_npad),
+    )
+}
+
+fn note_replay_saved(skip: bool) {
+    if skip {
+        println!("[smush_info] hid: replay saved to sd, skipping results");
+    } else {
+        println!("[smush_info] hid: replay saved to sd, results left up");
+    }
+}
+
 fn hid_exit_buttons(kind: PadKind, ms: u128) -> u64 {
     let cycle = HID_PULSE_MS + HID_GAP_MS;
     if (ms % cycle) >= HID_PULSE_MS {
@@ -813,14 +816,14 @@ fn hid_buttons_for_pad(
         // Nothing we can drive, so muting would only trap the players here.
         HidPhase::WaitPad => HidAction::Pass,
         HidPhase::Save => {
-            if is_save_pad(pad, save_npad) {
+            if pad_gets_macro(pad, kind, save_npad) {
                 HidAction::Mask(hid_map_logical(kind, hid_save_buttons(phase_ms)))
             } else {
                 HidAction::Mask(HidOut::MUTE)
             }
         }
         HidPhase::Back => {
-            if is_save_pad(pad, save_npad) {
+            if pad_gets_macro(pad, kind, save_npad) {
                 HidAction::Mask(hid_map_logical(kind, hid_back_buttons(phase_ms)))
             } else {
                 HidAction::Mask(HidOut::MUTE)
@@ -1123,10 +1126,13 @@ fn hid_mask_buttons(pad: u32, kind: PadKind) -> HidAction {
     }
     st.absorb_suspend_gap(now);
     st.last_hid_poll = Some(now);
-    match st.save_npad {
-        Some(id) if id == pad => st.save_pad_polls = 0,
-        Some(_) => st.save_pad_polls = st.save_pad_polls.saturating_add(1),
-        None => {}
+    if let Some(id) = st.save_npad {
+        st.save_pad_polls = observe_save_silence(
+            st.save_pad_polls,
+            id == pad,
+            pad_styles(pad),
+            kind,
+        );
     }
     let elapsed = st
         .hid_began
@@ -1154,8 +1160,13 @@ fn hid_mask_buttons(pad: u32, kind: PadKind) -> HidAction {
     let dump_ok = st.dump_ok();
     if matches!(st.hid_phase, HidPhase::Save | HidPhase::Back | HidPhase::WaitPad) {
         let switched = refresh_save_npad(&mut st);
-        if switched && st.hid_phase == HidPhase::Save && st.save_npad.is_some() {
-            // New pad gets the whole A A Y Right A, not the tail.
+        if switched
+            && st.hid_phase == HidPhase::Save
+            && st.save_npad.is_some()
+            && restart_save_clock_on_retarget(any_full_pad())
+        {
+            // Lone Joy-Con remap target changed. It was not receiving the
+            // earlier taps, so start A A Y over. Full slots share one clock.
             st.set_phase(HidPhase::Save, now);
             phase_ms = 0;
         }
@@ -1165,6 +1176,10 @@ fn hid_mask_buttons(pad: u32, kind: PadKind) -> HidAction {
     {
         if st.save_npad.is_some() {
             st.logged_wait_pad = false;
+            println!(
+                "[smush_info] hid: controller showed up, save seq, full pads {}",
+                full_pad_count()
+            );
             st.set_phase(HidPhase::Save, now);
             phase_ms = 0;
         } else if st.hid_phase != HidPhase::WaitPad {
@@ -1184,9 +1199,10 @@ fn hid_mask_buttons(pad: u32, kind: PadKind) -> HidAction {
             st.save_pad_polls = 0;
             if let Some(id) = st.save_npad {
                 println!(
-                    "[smush_info] hid: save pad {:#x} ({})",
+                    "[smush_info] hid: save pad {:#x} ({}), full pads {}",
                     id,
-                    style_names(pad_styles(id))
+                    style_names(pad_styles(id)),
+                    full_pad_count()
                 );
                 st.set_phase(HidPhase::Save, now);
             } else {
@@ -1204,6 +1220,7 @@ fn hid_mask_buttons(pad: u32, kind: PadKind) -> HidAction {
         phase_ms = 0;
     }
     if st.hid_phase == HidPhase::Save && dump_ok {
+        note_replay_saved(skip);
         st.set_phase(if skip { HidPhase::Skip } else { HidPhase::Done }, now);
         phase_ms = 0;
     } else if st.hid_phase == HidPhase::Save && phase_ms >= HID_SAVE_MS {
@@ -1211,6 +1228,7 @@ fn hid_mask_buttons(pad: u32, kind: PadKind) -> HidAction {
         phase_ms = 0;
     }
     if st.hid_phase == HidPhase::DumpWait && dump_ok {
+        note_replay_saved(skip);
         st.set_phase(if skip { HidPhase::Skip } else { HidPhase::Done }, now);
         phase_ms = 0;
     } else if st.hid_phase == HidPhase::DumpWait && phase_ms >= HID_DUMP_WAIT_MS {

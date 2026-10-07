@@ -2,7 +2,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-const DIR: &str = "sd:/smush_info";
 const REPLAY_DIR: &str = "sd:/ultimate/smush_info/replays";
 const MAX_MATCHES: usize = 100;
 
@@ -85,8 +84,16 @@ pub(crate) fn native_filename(path: &str) -> Option<String> {
     Some(base.to_string())
 }
 
+fn match_dir(stem: &str) -> PathBuf {
+    Path::new(REPLAY_DIR).join(stem)
+}
+
+fn log_path(stem: &str) -> PathBuf {
+    match_dir(stem).join(format!("{}.log", stem))
+}
+
 fn patch_replay_file(stem: &str, replay_file: &str) {
-    let path = Path::new(DIR).join(format!("{}.log", stem));
+    let path = log_path(stem);
     let Ok(raw) = fs::read(&path) else {
         return;
     };
@@ -115,20 +122,10 @@ fn patch_replay_file(stem: &str, replay_file: &str) {
 }
 
 fn remove_match(stem: &str) {
-    for ext in [".log", ".bin"] {
-        let path = PathBuf::from(DIR).join(format!("{}{}", stem, ext));
-        if path.exists() {
-            if let Err(e) = fs::remove_file(&path) {
-                println!("[smush_info] failed to prune {:?}: {}", path, e);
-            }
-        }
-    }
-    for base in [DIR, REPLAY_DIR] {
-        let dir = PathBuf::from(base).join(stem);
-        if dir.is_dir() {
-            if let Err(e) = fs::remove_dir_all(&dir) {
-                println!("[smush_info] failed to prune {:?}: {}", dir, e);
-            }
+    let dir = match_dir(stem);
+    if dir.is_dir() {
+        if let Err(e) = fs::remove_dir_all(&dir) {
+            println!("[smush_info] failed to prune {:?}: {}", dir, e);
         }
     }
 }
@@ -158,7 +155,6 @@ fn collect_stems(dir: &str, stems: &mut Vec<String>) {
 #[inline(never)]
 fn prune_oldest(keep_stem: &str) {
     let mut stems: Vec<String> = Vec::new();
-    collect_stems(DIR, &mut stems);
     collect_stems(REPLAY_DIR, &mut stems);
     stems.sort();
     while stems.len() > MAX_MATCHES {
@@ -174,11 +170,16 @@ fn prune_oldest(keep_stem: &str) {
 #[inline(never)]
 pub fn write_snapshot(json: &[u8]) -> Option<String> {
     let _g = dir_guard();
-    if !ensure_dir(DIR) {
+    if !ensure_dir(REPLAY_DIR) {
         return None;
     }
     let stem = timestamp_stem()?;
-    let path = Path::new(DIR).join(format!("{}.log", stem));
+    let dir = match_dir(&stem);
+    if let Err(e) = fs::create_dir_all(&dir) {
+        println!("[smush_info] failed to create {:?}: {}", dir, e);
+        return None;
+    }
+    let path = log_path(&stem);
     if let Err(e) = fs::write(&path, json) {
         println!("[smush_info] failed to write results log {:?}: {}", path, e);
         return None;
@@ -197,7 +198,7 @@ pub fn write_replay(stem: &str, vault_path: &str, data: &[u8]) -> bool {
         return false;
     }
     let name = native_filename(vault_path).unwrap_or_else(|| "replay.bin".to_string());
-    let dir = Path::new(REPLAY_DIR).join(stem);
+    let dir = match_dir(stem);
     if let Err(e) = fs::create_dir_all(&dir) {
         println!("[smush_info] failed to create {:?}: {}", dir, e);
         return false;
