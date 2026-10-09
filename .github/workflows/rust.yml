@@ -30,6 +30,12 @@ jobs:
       - name: Build release NRO
         id: build_release
         run: RUSTFLAGS=-g cargo-skyline skyline build --release
+      - name: Upload NRO artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: libsmush_info-nro
+          path: target/aarch64-skyline-switch/release/libsmush_info.nro
+          if-no-files-found: error
       - name: Upload binaries to release
         # Pull request refs are refs/pull/N/merge, and GitHub will not create a release for that tag.
         if: github.event_name != 'pull_request'
