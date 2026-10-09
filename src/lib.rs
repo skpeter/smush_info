@@ -14,15 +14,16 @@ use smash::lib::lua_const::*;
 use smash::lua2cpp::{L2CFighterCommon, L2CFighterCommon_status_pre_Rebirth, L2CFighterCommon_status_pre_Entry, L2CFighterCommon_sub_damage_uniq_process_init, L2CFighterCommon_status_pre_Dead};
 use smash::lib::L2CValue;
 
-use smush_info_shared::{Character, Info};
+use smush_info_shared::{should_write_stats_snapshot, Character, Info};
 
 use smash::Vector3f;
 use smash::Vector2f;
 
-use smashline::{Agent, L2CFighterCommon as SmashlineFighterCommon, Main};
+use smashline::{Agent, ExecStop, L2CFighterCommon as SmashlineFighterCommon, Main};
 
 mod conversions;
 use conversions::{kind_to_char, stage_id_to_stage};
+mod match_feed;
 mod results_log;
 mod udp;
 
@@ -153,19 +154,31 @@ unsafe extern "C" fn once_per_frame_per_fighter(fighter: &mut SmashlineFighterCo
     GAME_INFO.players[player_num].x.store(screen_pos.x, Ordering::SeqCst);
     GAME_INFO.players[player_num].y.store(screen_pos.y, Ordering::SeqCst);
     // Game thread stack is ~1MB. Rust plugin threads are 64KB and abort if dump/serde inlines in.
+    // The gate runs before the sample so a new match clears stale slots first.
     if player_num == 0 {
-        tick_match_state();
+        tick_match_state(true);
+    }
+    if player_num < 2 {
+        match_feed::capture(module_accessor, player_num);
+    }
+    if player_num == 0 {
+        flush_match_snapshot();
     }
 }
 
 fn install_fighter_frame_hook() {
     Agent::new("fighter")
         .on_line(Main, once_per_frame_per_fighter)
+        .on_line(ExecStop, once_per_frame_per_fighter)
         .install();
 }
 
 
-static GAME_INFO: Info = Info::new();
+pub(crate) static GAME_INFO: Info = Info::new();
+
+pub(crate) fn game_info() -> &'static Info {
+    &GAME_INFO
+}
 
 const MATCH_TICK_MS: u64 = 16;
 const SNAPSHOT_COOLDOWN_TICKS: u64 = 120_000 / MATCH_TICK_MS;
@@ -267,8 +280,28 @@ fn is_game_over(is_results: bool, is_match: bool) -> bool {
 }
 
 #[inline(never)]
-fn dump_game_info_snapshot() -> bool {
-    match serde_json::to_vec(&GAME_INFO) {
+fn dump_game_info_snapshot(include_openings: bool) -> bool {
+    let encoded = if include_openings {
+        match serde_json::to_value(&GAME_INFO) {
+            Ok(mut value) => {
+                if let Some(object) = value.as_object_mut() {
+                    let characters = [
+                        GAME_INFO.players[0].character(),
+                        GAME_INFO.players[1].character(),
+                    ];
+                    object.insert(
+                        "openings".to_string(),
+                        match_feed::openings_json(characters),
+                    );
+                }
+                serde_json::to_vec(&value)
+            }
+            Err(e) => Err(e),
+        }
+    } else {
+        serde_json::to_vec(&GAME_INFO)
+    };
+    match encoded {
         Ok(mut data) => {
             data.push(b'\n');
             results_log::write_snapshot(&data)
@@ -284,23 +317,51 @@ struct MatchTickState {
     prev_game_over: bool,
     saw_match: bool,
     ticks_since_dump: u64,
+    stats_was_eligible: bool,
+    stats_latched: bool,
+    stats_dumped: bool,
+    pending_dump: bool,
+    pending_openings: bool,
 }
 
 static mut MATCH_TICK: MatchTickState = MatchTickState {
     prev_game_over: false,
     saw_match: false,
     ticks_since_dump: SNAPSHOT_COOLDOWN_TICKS,
+    stats_was_eligible: false,
+    stats_latched: false,
+    stats_dumped: false,
+    pending_dump: false,
+    pending_openings: false,
 };
 
 #[inline(never)]
-fn tick_match_state() {
+fn flush_match_snapshot() {
     unsafe {
-        update_match_state(&mut MATCH_TICK);
+        if !MATCH_TICK.pending_dump {
+            return;
+        }
+        let include_openings = MATCH_TICK.pending_openings;
+        let dump: fn(bool) -> bool = dump_game_info_snapshot;
+        if std::hint::black_box(dump)(include_openings) {
+            MATCH_TICK.ticks_since_dump = 0;
+            MATCH_TICK.pending_dump = false;
+            if include_openings {
+                MATCH_TICK.stats_dumped = true;
+            }
+        }
     }
 }
 
 #[inline(never)]
-unsafe fn update_match_state(state: &mut MatchTickState) {
+fn tick_match_state(on_game_thread: bool) {
+    unsafe {
+        update_match_state(&mut MATCH_TICK, on_game_thread);
+    }
+}
+
+#[inline(never)]
+unsafe fn update_match_state(state: &mut MatchTickState, on_game_thread: bool) {
     // FighterManager singleton may not exist yet (early in app boot, before title screen)
     // and FIGHTER_MANAGER_ADDR can be 0 if LookupSymbol failed. Treat both as "no match"
     // to avoid dereferencing a null this-pointer in entry_count/is_result_mode.
@@ -329,13 +390,59 @@ unsafe fn update_match_state(state: &mut MatchTickState) {
     }
 
     let game_over = state.saw_match && is_game_over(is_results, is_match);
-    if game_over && !state.prev_game_over && state.ticks_since_dump >= SNAPSHOT_COOLDOWN_TICKS {
+    // gstack-shortcut(dec-6ea7e982-17b2-4d92-824f-8fa6f2edd87d): 6/10, upgrade when Spirits, Classic, and World of Light menu ids are known
+    let entry_count = if mgr.is_null() {
+        0
+    } else {
+        FighterManager::entry_count(mgr)
+    };
+    let training = app::smashball::is_training_mode();
+    let ice_climbers = (0..8).any(|slot| {
+        let player = &GAME_INFO.players[slot];
+        player.is_in_game.load(Ordering::SeqCst) && is_ice_climbers(player.character.load(Ordering::SeqCst))
+    });
+    let eligible = is_match && entry_count == 2 && !training && !ice_climbers;
+    if on_game_thread {
+        if is_results {
+            match_feed::set_sampling(false);
+        } else if eligible {
+            if !state.stats_was_eligible {
+                match_feed::reset(&GAME_INFO);
+                state.stats_dumped = false;
+                state.stats_latched = true;
+                state.stats_was_eligible = true;
+            }
+            match_feed::set_sampling(true);
+        } else {
+            match_feed::set_sampling(false);
+            state.stats_was_eligible = false;
+            state.stats_latched = false;
+            state.stats_dumped = false;
+            match_feed::reset(&GAME_INFO);
+        }
+    }
+
+    let game_over_edge = game_over && !state.prev_game_over;
+    let latched_write = state.stats_latched && !state.stats_dumped;
+    let write_edge = game_over_edge || (latched_write && game_over);
+    if should_write_stats_snapshot(
+        latched_write,
+        write_edge,
+        on_game_thread,
+        state.ticks_since_dump,
+        SNAPSHOT_COOLDOWN_TICKS,
+    ) {
         if is_results {
             GAME_INFO.is_results_screen.store(true, Ordering::SeqCst);
         }
-        let dump: fn() -> bool = dump_game_info_snapshot;
-        if std::hint::black_box(dump)() {
-            state.ticks_since_dump = 0;
+        if on_game_thread {
+            state.pending_dump = true;
+            state.pending_openings = state.stats_latched;
+        } else if !state.stats_latched {
+            let dump: fn(bool) -> bool = dump_game_info_snapshot;
+            if std::hint::black_box(dump)(false) {
+                state.ticks_since_dump = 0;
+            }
         }
     }
 
@@ -428,7 +535,7 @@ fn start_server() -> Result<(), i64> {
 
 
         loop {
-            tick_match_state();
+            tick_match_state(false);
             let mut data = serde_json::to_vec(&GAME_INFO).unwrap();
             data.push(b'\n');
             match send_bytes(client_socket, &data) {
@@ -890,8 +997,8 @@ fn udp_broadcast_loop() {
         std::thread::sleep(std::time::Duration::from_secs(1));
         udp::broadcast_device_info();
         // 1Hz results fallback when no overlay and no fighter frames (e.g. IC → results).
-        let tick: fn() = tick_match_state;
-        std::hint::black_box(tick)();
+        let tick: fn(bool) = tick_match_state;
+        std::hint::black_box(tick)(false);
     }
 }
 

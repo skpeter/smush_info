@@ -1,5 +1,5 @@
 //#![feature(const_mut_refs)]
-use std::sync::atomic::{AtomicI32, AtomicU32, AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use serde::{Serialize, Deserialize};
 use std::fmt;
 
@@ -11,6 +11,18 @@ pub use atomic_arena_id::AtomicArenaId;
 
 mod atomic_name;
 pub use atomic_name::AtomicName;
+
+mod atomic_text;
+pub use atomic_text::AtomicText;
+
+mod match_stats;
+pub use match_stats::{
+    map_status, should_write_stats_snapshot, FighterSummary, FrameSample, MatchStats, OpeningRecord,
+    Phase,
+};
+
+mod move_names;
+pub use move_names::display_name;
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct Info {
@@ -40,6 +52,20 @@ pub struct Player {
     pub hero_menu_selection: AtomicU32,
     /// Team index from `TeamModule::team_no`: 0–3 in team battle, -1 otherwise.
     pub team: AtomicI32,
+    pub neutral_wins: AtomicU32,
+    pub neutral_losses: AtomicU32,
+    pub non_killing_wins: AtomicU32,
+    pub stage_control: AtomicU32,
+    pub avg_damage_per_opening: AtomicF32,
+    pub top_opener: AtomicU64,
+    pub top_opener_name: AtomicText,
+    pub avg_death: AtomicF32,
+    pub earliest_death: AtomicF32,
+    pub latest_death: AtomicF32,
+    pub damage_dealt: AtomicF32,
+    pub damage_taken: AtomicF32,
+    pub match_self_destructs: AtomicU32,
+    pub stocks_taken: AtomicU32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1070,7 +1096,43 @@ impl Player {
             hero_menu_selected: AtomicBool::new(false),
             hero_menu_selection: AtomicU32::new(0),
             team: AtomicI32::new(-1),
+            neutral_wins: AtomicU32::new(0),
+            neutral_losses: AtomicU32::new(0),
+            non_killing_wins: AtomicU32::new(0),
+            stage_control: AtomicU32::new(0),
+            avg_damage_per_opening: AtomicF32::new(0.),
+            top_opener: AtomicU64::new(0),
+            top_opener_name: AtomicText::new(),
+            avg_death: AtomicF32::new(0.),
+            earliest_death: AtomicF32::new(0.),
+            latest_death: AtomicF32::new(0.),
+            damage_dealt: AtomicF32::new(0.),
+            damage_taken: AtomicF32::new(0.),
+            match_self_destructs: AtomicU32::new(0),
+            stocks_taken: AtomicU32::new(0),
         }
+    }
+
+    pub fn clear_match_stats(&self) {
+        let zero = FighterSummary::zero();
+        self.store_match_stats(&zero, "");
+    }
+
+    pub fn store_match_stats(&self, summary: &FighterSummary, opener_name: &str) {
+        self.neutral_wins.store(summary.neutral_wins, Ordering::SeqCst);
+        self.neutral_losses.store(summary.neutral_losses, Ordering::SeqCst);
+        self.non_killing_wins.store(summary.non_killing_wins, Ordering::SeqCst);
+        self.stage_control.store(summary.stage_control_frames, Ordering::SeqCst);
+        self.avg_damage_per_opening.store(summary.avg_damage_per_opening, Ordering::SeqCst);
+        self.top_opener.store(summary.top_opener, Ordering::SeqCst);
+        self.top_opener_name.store_str(opener_name, Ordering::SeqCst);
+        self.avg_death.store(summary.avg_death, Ordering::SeqCst);
+        self.earliest_death.store(summary.earliest_death, Ordering::SeqCst);
+        self.latest_death.store(summary.latest_death, Ordering::SeqCst);
+        self.damage_dealt.store(summary.damage_dealt, Ordering::SeqCst);
+        self.damage_taken.store(summary.damage_taken, Ordering::SeqCst);
+        self.match_self_destructs.store(summary.self_destructs, Ordering::SeqCst);
+        self.stocks_taken.store(summary.stocks_taken, Ordering::SeqCst);
     }
 
     pub fn character(&self) -> Character {
