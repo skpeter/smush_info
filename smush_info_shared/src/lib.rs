@@ -22,7 +22,7 @@ pub use match_stats::{
 };
 
 mod move_names;
-pub use move_names::display_name;
+pub use move_names::{display_name, preload as preload_move_names};
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct Info {

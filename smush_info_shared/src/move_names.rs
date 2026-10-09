@@ -23,6 +23,12 @@ pub fn pick_name<'a>(english: &'a str, specific: &'a str, general: &'a str) -> O
     }
 }
 
+/// Build the name table once. Call this from plugin load so the first hit
+/// does not parse the sheet on the game thread.
+pub fn preload() {
+    let _ = names();
+}
+
 pub fn lookup(character: Character, hash: u64) -> Option<&'static str> {
     names()
         .get(&(character as u32, hash))
@@ -210,6 +216,12 @@ mod tests {
     #[test]
     fn every_sheet_character_maps_onto_the_enum() {
         assert_eq!(unmapped_sheet_characters(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn preload_builds_the_table_before_a_lookup() {
+        preload();
+        assert_eq!(lookup(Character::Pikachu, 0x047dee83e5), Some("Idle"));
     }
 
     #[test]

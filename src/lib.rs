@@ -1004,6 +1004,9 @@ fn udp_broadcast_loop() {
 
 #[skyline::main(name = "discord_server")]
 pub fn main() {
+    // The sheet is parsed on the first real lookup. Do that here, on the load
+    // thread, so the first hit of a session does not stall the game thread.
+    smush_info_shared::preload_move_names();
     search_offsets();
     skyline::nro::add_hook(nro_main).unwrap();
     unsafe {
