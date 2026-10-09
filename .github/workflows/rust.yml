@@ -31,6 +31,8 @@ jobs:
         id: build_release
         run: RUSTFLAGS=-g cargo-skyline skyline build --release
       - name: Upload binaries to release
+        # Pull request refs are refs/pull/N/merge, and GitHub will not create a release for that tag.
+        if: github.event_name != 'pull_request'
         uses: svenstaro/upload-release-action@v2
         with:
           repo_token: ${{ secrets.GITHUB_TOKEN }}
