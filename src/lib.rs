@@ -309,7 +309,7 @@ unsafe fn update_match_state(state: &mut MatchTickState) {
     } else {
         *(FIGHTER_MANAGER_ADDR as *mut *mut app::FighterManager)
     };
-    let current_menu: u32 = *(offset_to_addr(0x53040f0) as *const u32);
+    let current_menu: u32 = *(offset_to_addr(0x53050f0) as *const u32); // 13.0.5 (was 0x53040f0 on 13.0.4)
     const CONTROLS_SCREEN_MENU: u32 = 0x6020000; //is_match is set to true when the player in the controls screen, i assume because there is a sandbag and mario. this ensures we're not in the controls screen
     const MII_MAKER_MENU: u32 = 0x4050000; //performs same check to make sure we're not on mii maker
     let menu_is_gameplay = current_menu != CONTROLS_SCREEN_MENU && current_menu != MII_MAKER_MENU;
@@ -669,11 +669,12 @@ fn nro_main(nro: &skyline::nro::NroInfo<'_>) {
 }
 
 
+// 13.0.5: UPDATE_TAG unchanged; PLAYER_SAVE/PLAYER_TAG +0x1000 vs 13.0.4 (HDR / neighbor slide)
 static UPDATE_TAG_FOR_PLAYER_OFFSET: usize = 0x19fd0b0;
-static PLAYER_SAVE_OFFSET: usize = 0x5313510;
+static PLAYER_SAVE_OFFSET: usize = 0x5314510;
 static mut PLAYER_SAVE_ADDRESS: *const u64 = 0x0 as *const u64;
 
-static PLAYER_TAG_OFFSET: usize = 0x52C4758;
+static PLAYER_TAG_OFFSET: usize = 0x52C5758; // predicted +0x1000; confirm on console
 
 pub fn get_tag_of_player(player_index: usize) -> String {
     let player_tag_offset = PLAYER_TAG_OFFSET + (player_index * 0x260);
@@ -820,7 +821,7 @@ fn server_supervisor() {
     }
 }
 
-#[skyline::hook(offset = 0x2335184, inline)]
+#[skyline::hook(offset = 0x23355d4, inline)] // 13.0.5 (was 0x2335184 on 13.0.4)
 unsafe fn selected_stage(_ctx: &InlineCtx) {
     println!("stage has been selected");
     GAME_INFO.is_results_screen.store(false, Ordering::SeqCst);
