@@ -55,6 +55,8 @@ pub struct FrameSample {
     pub world_x: f32,
     pub stocks: u32,
     pub suicide_count: u32,
+    /// Character enum discriminant at sample time (Pyra/Mythra-safe for names).
+    pub character: u32,
 }
 
 impl FrameSample {
@@ -67,12 +69,14 @@ impl FrameSample {
             world_x: 0.0,
             stocks: 3,
             suicide_count: 0,
+            character: 0,
         }
     }
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct OpeningRecord {
+    pub character: u32,
     pub opener: u64,
     pub damage_start: f32,
     pub damage_end: f32,
@@ -119,29 +123,71 @@ impl FighterSummary {
 
 #[derive(Clone, Debug)]
 struct ComboString {
+    character: u32,
     moves: Vec<u64>,
     damage_at_start: f32,
     damage_at_end: f32,
     killed: bool,
 }
 
-/// Eligible versus results ignore the two-minute cooldown and are written from
-/// the game thread. Other modes keep the cooldown and may be written from the
-/// UDP fallback when no fighter frame is running.
+/// Eligible versus results ignore the two-minute cooldown. They may be written
+/// from the game thread or from the TCP/UDP fallback when fighter hooks have
+/// stopped (the dump path must use a large stack for openings serde). Other
+/// modes keep the cooldown.
 pub fn should_write_stats_snapshot(
     latched_eligible: bool,
-    game_over_edge: bool,
-    on_game_thread: bool,
+    write_edge: bool,
     ticks_since_dump: u64,
     cooldown: u64,
 ) -> bool {
-    if !game_over_edge {
+    if !write_edge {
         return false;
     }
     if latched_eligible {
-        return on_game_thread;
+        return true;
     }
     ticks_since_dump >= cooldown
+}
+
+/// Sorted pair of entry ids that are in-game. Exactly two required.
+pub fn active_entry_pair(in_game: [bool; 8]) -> Option<[usize; 2]> {
+    let mut first = None;
+    let mut second = None;
+    for i in 0..8 {
+        if !in_game[i] {
+            continue;
+        }
+        match (first, second) {
+            (None, _) => first = Some(i),
+            (Some(_), None) => second = Some(i),
+            _ => return None,
+        }
+    }
+    match (first, second) {
+        (Some(a), Some(b)) if a < b => Some([a, b]),
+        (Some(a), Some(b)) => Some([b, a]),
+        _ => None,
+    }
+}
+
+/// Calculator slot for an entry id, or None if that entry is not in the active pair.
+pub fn slot_for_entry(entry: usize, in_game: [bool; 8]) -> Option<usize> {
+    let pair = active_entry_pair(in_game)?;
+    if entry == pair[0] {
+        Some(0)
+    } else if entry == pair[1] {
+        Some(1)
+    } else {
+        None
+    }
+}
+
+/// Lower entry id of the active pair owns match tick/flush. Falls back to entry 0
+/// until both fighters have been marked in-game.
+pub fn tick_owner_entry(in_game: [bool; 8]) -> usize {
+    active_entry_pair(in_game)
+        .map(|pair| pair[0])
+        .unwrap_or(0)
 }
 
 pub struct MatchStats {
@@ -150,6 +196,7 @@ pub struct MatchStats {
     in_neutral: [bool; 2],
     neutral_counter: [u32; 2],
     old_damage_dealt: [f32; 2],
+    damage_seen: [bool; 2],
     string_old_damage: [f32; 2],
     damage_dealt: [f32; 2],
     damage_taken: [f32; 2],
@@ -163,6 +210,8 @@ pub struct MatchStats {
     baseline_ready: [bool; 2],
     stage_control: [u32; 2],
     strings: [Vec<ComboString>; 2],
+    /// Cached on each new string so publish does not rebuild a HashMap every frame.
+    top_opener: [u64; 2],
     being_comboed_by: [i8; 2],
     hitstun_counter: [u32; 2],
 }
@@ -175,6 +224,7 @@ impl MatchStats {
             in_neutral: [true, true],
             neutral_counter: [0, 0],
             old_damage_dealt: [0.0, 0.0],
+            damage_seen: [false, false],
             string_old_damage: [0.0, 0.0],
             damage_dealt: [0.0, 0.0],
             damage_taken: [0.0, 0.0],
@@ -188,6 +238,7 @@ impl MatchStats {
             baseline_ready: [false, false],
             stage_control: [0, 0],
             strings: [Vec::new(), Vec::new()],
+            top_opener: [0, 0],
             being_comboed_by: [-1, -1],
             hitstun_counter: [0, 0],
         }
@@ -212,10 +263,6 @@ impl MatchStats {
         } else {
             false
         }
-    }
-
-    pub fn discard_fresh(&mut self) {
-        self.fresh = [false, false];
     }
 
     pub fn is_neutral(&self, slot: usize) -> bool {
@@ -252,7 +299,7 @@ impl MatchStats {
             non_killing_wins: non_killing,
             stage_control_frames: self.stage_control[slot],
             avg_damage_per_opening: if wins == 0 { 0.0 } else { dealt / wins as f32 },
-            top_opener: most_common_opener(&self.strings[slot]),
+            top_opener: self.top_opener[slot],
             avg_death: avg(&self.death_percents[slot]),
             earliest_death: min_or_zero(&self.death_percents[slot]),
             latest_death: max_or_zero(&self.death_percents[slot]),
@@ -276,6 +323,7 @@ impl MatchStats {
             .filter_map(|string| {
                 let opener = *string.moves.first()?;
                 Some(OpeningRecord {
+                    character: string.character,
                     opener,
                     damage_start: string.damage_at_start,
                     damage_end: string.damage_at_end,
@@ -307,6 +355,14 @@ impl MatchStats {
 
     fn update_damage(&mut self, samples: &[FrameSample]) {
         for i in 0..2 {
+            // First sample sets the baseline only. A rematch or late latch at
+            // non-zero percent must not look like a damage spike from 0.
+            if !self.damage_seen[i] {
+                self.old_damage_dealt[i] = samples[i].damage;
+                self.string_old_damage[i] = samples[i].damage;
+                self.damage_seen[i] = true;
+                continue;
+            }
             let delta = samples[i].damage - self.old_damage_dealt[i];
             self.old_damage_dealt[i] = samples[i].damage;
             if delta > 0.0 {
@@ -362,11 +418,13 @@ impl MatchStats {
                 self.being_comboed_by[them] = me as i8;
                 self.hitstun_counter[them] = OPENING_HITSTUN_FRAMES;
                 self.strings[me].push(ComboString {
+                    character: samples[me].character,
                     moves: vec![samples[me].motion],
                     damage_at_start: self.string_old_damage[them],
                     damage_at_end: samples[them].damage,
                     killed: false,
                 });
+                self.top_opener[me] = most_common_opener(&self.strings[me]);
             } else if self.being_comboed_by[them] >= 0 {
                 let me = self.being_comboed_by[them] as usize;
                 if samples[them].hitstun > 0.0 {
@@ -412,12 +470,6 @@ impl MatchStats {
     }
 }
 
-impl Default for MatchStats {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 const fn blank_sample() -> FrameSample {
     FrameSample {
         damage: 0.0,
@@ -427,6 +479,7 @@ const fn blank_sample() -> FrameSample {
         world_x: 0.0,
         stocks: 0,
         suicide_count: 0,
+        character: 0,
     }
 }
 
@@ -585,6 +638,11 @@ mod tests {
     #[test]
     fn heals_do_not_add_damage() {
         let mut stats = MatchStats::new();
+        step(
+            &mut stats,
+            FrameSample::neutral(0.0),
+            FrameSample::neutral(0.0),
+        );
         let mut hurt = FrameSample::neutral(30.0);
         step(&mut stats, FrameSample::neutral(0.0), hurt);
         assert_eq!(stats.summary()[0].damage_dealt, 30.0);
@@ -592,6 +650,28 @@ mod tests {
         step(&mut stats, FrameSample::neutral(0.0), hurt);
         assert_eq!(stats.summary()[0].damage_dealt, 30.0);
         assert_eq!(stats.summary()[1].damage_taken, 30.0);
+    }
+
+    #[test]
+    fn first_sample_percent_is_baseline_not_damage_dealt() {
+        let mut stats = MatchStats::new();
+        let mut a = FrameSample::neutral(0.0);
+        let mut b = FrameSample::neutral(55.0);
+        step(&mut stats, a, b);
+        assert_eq!(stats.summary()[0].damage_dealt, 0.0);
+        assert_eq!(stats.summary()[1].damage_taken, 0.0);
+        b.damage = 70.0;
+        step(&mut stats, a, b);
+        assert_eq!(stats.summary()[0].damage_dealt, 15.0);
+        assert_eq!(stats.summary()[1].damage_taken, 15.0);
+        a.character = 42;
+        a.motion = 0xabc;
+        b.hitstun = 4.0;
+        b.phase = Phase::Hitstun;
+        step(&mut stats, a, b);
+        let openings = stats.openings();
+        assert_eq!(openings[0][0].character, 42);
+        assert_eq!(openings[0][0].opener, 0xabc);
     }
 
     #[test]
@@ -715,12 +795,24 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_write_bypasses_cooldown_only_for_a_latched_game_thread_edge() {
-        assert!(should_write_stats_snapshot(true, true, true, 0, 7500));
-        assert!(!should_write_stats_snapshot(true, true, false, 7500, 7500));
-        assert!(!should_write_stats_snapshot(true, false, true, 7500, 7500));
-        assert!(!should_write_stats_snapshot(false, true, true, 10, 7500));
-        assert!(should_write_stats_snapshot(false, true, true, 7500, 7500));
-        assert!(should_write_stats_snapshot(false, true, false, 7500, 7500));
+    fn snapshot_write_bypasses_cooldown_for_a_latched_edge_on_any_thread() {
+        assert!(should_write_stats_snapshot(true, true, 0, 7500));
+        assert!(should_write_stats_snapshot(true, true, 7500, 7500));
+        assert!(!should_write_stats_snapshot(true, false, 7500, 7500));
+        assert!(!should_write_stats_snapshot(false, true, 10, 7500));
+        assert!(should_write_stats_snapshot(false, true, 7500, 7500));
+    }
+
+    #[test]
+    fn active_entry_pair_sorts_and_rejects_wrong_counts() {
+        let mut flags = [false; 8];
+        flags[2] = true;
+        flags[5] = true;
+        assert_eq!(active_entry_pair(flags), Some([2, 5]));
+        assert_eq!(slot_for_entry(5, flags), Some(1));
+        assert_eq!(tick_owner_entry(flags), 2);
+        flags[0] = true;
+        assert_eq!(active_entry_pair(flags), None);
+        assert_eq!(tick_owner_entry([false; 8]), 0);
     }
 }

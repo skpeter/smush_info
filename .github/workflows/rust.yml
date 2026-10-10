@@ -23,6 +23,10 @@ jobs:
         with:
           prefix-key: "plugin"
           cache-all-crates: true
+      - name: Host-test shared crate
+        # smush_info_shared is a path dep, not a workspace member — run from its directory.
+        working-directory: smush_info_shared
+        run: cargo test --lib
       - name: Install Skyline
         run: |
           cargo install cargo-skyline

@@ -13,6 +13,12 @@ union Transmute {
     bits: [u64; 8],
 }
 
+impl Default for AtomicText {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AtomicText {
     pub const fn new() -> Self {
         Self([

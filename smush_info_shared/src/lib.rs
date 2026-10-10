@@ -17,12 +17,15 @@ pub use atomic_text::AtomicText;
 
 mod match_stats;
 pub use match_stats::{
-    map_status, should_write_stats_snapshot, FighterSummary, FrameSample, MatchStats, OpeningRecord,
-    Phase,
+    active_entry_pair, map_status, should_write_stats_snapshot, slot_for_entry, tick_owner_entry,
+    FighterSummary, FrameSample, MatchStats, OpeningRecord, Phase,
 };
 
 mod move_names;
 pub use move_names::{display_name, preload as preload_move_names};
+
+mod ws;
+pub use ws::{handshake_response, text_frame};
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct Info {
@@ -52,19 +55,33 @@ pub struct Player {
     pub hero_menu_selection: AtomicU32,
     /// Team index from `TeamModule::team_no`: 0–3 in team battle, -1 otherwise.
     pub team: AtomicI32,
+    #[serde(default)]
     pub neutral_wins: AtomicU32,
+    #[serde(default)]
     pub neutral_losses: AtomicU32,
+    #[serde(default)]
     pub non_killing_wins: AtomicU32,
+    #[serde(default)]
     pub stage_control: AtomicU32,
+    #[serde(default)]
     pub avg_damage_per_opening: AtomicF32,
+    #[serde(default)]
     pub top_opener: AtomicU64,
+    #[serde(default)]
     pub top_opener_name: AtomicText,
+    #[serde(default)]
     pub avg_death: AtomicF32,
+    #[serde(default)]
     pub earliest_death: AtomicF32,
+    #[serde(default)]
     pub latest_death: AtomicF32,
+    #[serde(default)]
     pub damage_dealt: AtomicF32,
+    #[serde(default)]
     pub damage_taken: AtomicF32,
+    #[serde(default)]
     pub match_self_destructs: AtomicU32,
+    #[serde(default)]
     pub stocks_taken: AtomicU32,
 }
 
@@ -170,6 +187,16 @@ pub enum Character {
     Zelda,
     Zenigame,
     Max,
+}
+
+impl Character {
+    pub fn from_u32(c: u32) -> Character {
+        if (0..Character::Max as u32).contains(&c) {
+            unsafe { core::mem::transmute(c) }
+        } else {
+            Character::None
+        }
+    }
 }
 
 // see `Character` for how this should be used
@@ -1136,14 +1163,7 @@ impl Player {
     }
 
     pub fn character(&self) -> Character {
-        let c = self.character.load(Ordering::SeqCst);
-        if (0..Character::Max as u32).contains(&c) {
-            unsafe {
-                core::mem::transmute(c)
-            }
-        } else {
-            Character::None
-        }
+        Character::from_u32(self.character.load(Ordering::SeqCst))
     }
 
     pub fn damage(&self) -> f32 {
@@ -1221,6 +1241,31 @@ mod shared_tests {
 
         // Valid character
         assert_eq!(player.character(), Character::Zenigame);
+    }
+
+    #[test]
+    fn player_stats_fields_default_when_missing_from_json() {
+        let json = r#"{
+            "is_in_game": false,
+            "name": null,
+            "character": 0,
+            "stocks": 0,
+            "self_destructs": 0,
+            "damage": 0.0,
+            "is_cpu": false,
+            "skin": 0,
+            "x": 0.0,
+            "y": 0.0,
+            "hero_menu_open": false,
+            "hero_menu_selected": false,
+            "hero_menu_selection": 0,
+            "team": -1
+        }"#;
+        let player: Player = serde_json::from_str(json).unwrap();
+        assert_eq!(player.neutral_wins.load(Ordering::SeqCst), 0);
+        assert_eq!(player.stocks_taken.load(Ordering::SeqCst), 0);
+        assert_eq!(player.top_opener_name.load_string(Ordering::SeqCst), "");
+        assert_eq!(player.avg_damage_per_opening.load(Ordering::SeqCst), 0.0);
     }
 
     #[test]

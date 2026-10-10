@@ -10,6 +10,30 @@ Original Authors:
 
 Seems jam1garner has left the scene so I don't feel particularly comfortable asking them licensing questions, but consider everything I've added to this project GPLv3
 
+## Live socket (TCP `:4242`)
+
+Connect to the Switch on port **4242**. Each line is one JSON `Info` object (see `example.json`).
+
+For **versus 1v1** (including CPUs; not training, FFA, or doubles), each in-game player also carries per-game summary fields that update live and freeze on the results screen:
+
+| Field | Meaning |
+| --- | --- |
+| `neutral_wins` / `neutral_losses` / `non_killing_wins` | Opening counts |
+| `stage_control` | Frames closer to center while both are in neutral |
+| `avg_damage_per_opening` | Damage dealt ÷ neutral wins |
+| `top_opener` / `top_opener_name` | Most common opening motion (hash40 + sheet name) |
+| `avg_death` / `earliest_death` / `latest_death` | Death percents from the sample |
+| `damage_dealt` / `damage_taken` | Positive damage deltas only |
+| `match_self_destructs` / `stocks_taken` | SDs and stocks taken this game |
+
+Ineligible modes publish zeros. Spirits / Classic / World of Light menu ids are still unknown; if one of those looks like two fighters it may be counted as versus.
+
+If you show these numbers on a stream overlay, credit **Vye** (Vye#0547) and **TheComet** (TheComet#5387).
+
+## Results file
+
+Eligible versus games also write a results snapshot (same `Info` shape) with an extra top-level `openings` object. Keys `"0"` / `"1"` are calculator slots. Each opening row includes `character`, `opener`, `name`, damage bounds, `killed`, and `moves`. Character is captured when the string starts so Pyra↔Mythra mid-match does not rename earlier hits.
+
 # Requirements
 smush_info requires you to have the following Skyline plugins downloaded and installed:
 - [Arcropolis](https://github.com/Raytwo/ARCropolis/releases)
@@ -45,4 +69,10 @@ sd:/atmosphere/contents/01006A800016E000/romfs/skyline/plugins
 cargo skyline set-ip [Switch IP]
 # install to the correct plugin folder on the Switch and listen for logs
 cargo skyline run 
+```
+
+Host unit tests for the shared crate (path dep, not a workspace member):
+
+```sh
+cd smush_info_shared && cargo test --lib
 ```
