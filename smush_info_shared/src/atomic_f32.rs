@@ -6,6 +6,12 @@ use core::fmt;
 #[repr(transparent)]
 pub struct AtomicF32(AtomicU32); 
 
+impl Default for AtomicF32 {
+    fn default() -> Self {
+        Self::new(0.0)
+    }
+}
+
 impl AtomicF32 {
     pub const fn new(val: f32) -> Self {
         union Transmute { val: f32, out: u32}
