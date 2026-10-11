@@ -65,15 +65,20 @@ extern "C" {
     pub fn world_to_screen(vec: *const Vector3f, unk: bool) -> Float32x2;
 }
 
-fn send_bytes(socket: i32, bytes: &[u8]) -> Result<(), i64> {
-    unsafe {
-        let ret = send(socket, bytes.as_ptr() as *const _, bytes.len(), 0);
-        if ret < 0 {
-            Err(*errno_loc())
-        } else {
-            Ok(())
+fn send_bytes(socket: i32, mut bytes: &[u8]) -> Result<(), i64> {
+    while !bytes.is_empty() {
+        unsafe {
+            let ret = send(socket, bytes.as_ptr() as *const _, bytes.len(), 0);
+            if ret > 0 {
+                bytes = &bytes[ret as usize..];
+            } else if ret == 0 {
+                return Err(32);
+            } else {
+                return Err(*errno_loc());
+            }
         }
     }
+    Ok(())
 }
 
 fn close_socket_if_open(socket: &mut i32) {
@@ -89,7 +94,6 @@ fn close_socket_if_open(socket: &mut i32) {
 // connections, and a quiet client can be told apart from a browser upgrade.
 const SO_SNDTIMEO: i32 = 0x1005;
 const SO_RCVTIMEO: i32 = 0x1006;
-const CLIENT_DROPPED: [i64; 6] = [11, 32, 53, 54, 57, 60];
 
 #[repr(C)]
 struct timeval {
@@ -138,41 +142,54 @@ fn recv_some(socket: i32, buf: &mut [u8]) -> Result<Option<usize>, i64> {
     }
 }
 
-/// Browser clients send an upgrade. Raw TCP clients send nothing; a timeout means that.
-fn begin_client(socket: i32) -> Result<bool, i64> {
-    set_send_timeout(socket, 3);
-    if !set_sock_timeout(socket, SO_RCVTIMEO, 200) {
-        println!("[smush_info] SO_RCVTIMEO failed, treating client as raw tcp");
-        return Ok(false);
-    }
-    let mut request = Vec::new();
+struct MatchClient {
+    socket: i32,
+    websocket: bool,
+    probing: bool,
+    started: std::time::Instant,
+    request: Vec<u8>,
+}
+
+fn drop_client(client: &mut MatchClient) {
+    close_socket_if_open(&mut client.socket);
+}
+
+/// Browser clients send an upgrade immediately. Raw TCP clients send nothing.
+fn poll_probe(client: &mut MatchClient) -> Result<(), i64> {
     let mut tmp = [0u8; 512];
-    loop {
-        match recv_some(socket, &mut tmp)? {
-            Some(n) => {
-                request.extend_from_slice(&tmp[..n]);
-                if request.windows(4).any(|w| w == b"\r\n\r\n") || request.len() >= 2048 {
-                    break;
-                }
+    match recv_some(client.socket, &mut tmp)? {
+        Some(n) => {
+            client.request.extend_from_slice(&tmp[..n]);
+            if client.request.windows(4).any(|w| w == b"\r\n\r\n") || client.request.len() >= 2048 {
+                finish_probe(client)?;
             }
-            None => {
-                if request.is_empty() {
-                    println!("[smush_info] tcp client connected");
-                    return Ok(false);
-                }
+            Ok(())
+        }
+        None => {
+            if client.request.is_empty() && client.started.elapsed() >= Duration::from_millis(200) {
+                client.probing = false;
+                client.websocket = false;
+                println!("[smush_info] tcp client connected");
+            } else if !client.request.is_empty() && client.started.elapsed() >= Duration::from_millis(200) {
                 return Err(60);
             }
+            Ok(())
         }
     }
-    let text = String::from_utf8_lossy(&request);
+}
+
+fn finish_probe(client: &mut MatchClient) -> Result<(), i64> {
+    let text = String::from_utf8_lossy(&client.request);
     let Some(response) = handshake_response(&text) else {
         println!("[smush_info] closing client that did not request a websocket");
         return Err(32);
     };
-    send_bytes(socket, response.as_bytes())?;
-    let _ = set_sock_timeout(socket, SO_RCVTIMEO, 1);
+    send_bytes(client.socket, response.as_bytes())?;
+    client.request.clear();
+    client.probing = false;
+    client.websocket = true;
     println!("[smush_info] websocket client connected");
-    Ok(true)
+    Ok(())
 }
 
 fn drain_websocket(socket: i32) -> Result<(), i64> {
@@ -184,23 +201,18 @@ fn drain_websocket(socket: i32) -> Result<(), i64> {
     }
 }
 
-fn accept_link(listener_socket: i32) -> Result<(i32, bool), i64> {
+fn accept_clients(listener_socket: i32, incoming: std::sync::mpsc::Sender<i32>) {
     loop {
-        let socket = accept_client_socket(listener_socket)?;
-        match begin_client(socket) {
-            Ok(websocket) => return Ok((socket, websocket)),
-            Err(errno) if CLIENT_DROPPED.contains(&errno) => {
-                println!("[smush_info] client dropped during handshake (errno {})", errno);
-                unsafe {
-                    close(socket);
+        match accept_client_socket(listener_socket) {
+            Ok(socket) => {
+                if incoming.send(socket).is_err() {
+                    unsafe {
+                        close(socket);
+                    }
+                    break;
                 }
             }
-            Err(errno) => {
-                unsafe {
-                    close(socket);
-                }
-                return Err(errno);
-            }
+            Err(_) => break,
         }
     }
 }
@@ -717,74 +729,87 @@ fn start_server() -> Result<(), i64> {
             size_of_val(&server_addr) as u32,
         ));
 
-        dbg_err!(listen(listener_socket, 1));
+        dbg_err!(listen(listener_socket, 8));
         println!("[smush_info] match socket listening on 4242");
-        let accepted = accept_link(listener_socket)?;
-        client_socket = accepted.0;
-        let mut websocket = accepted.1;
+        let (incoming_tx, incoming_rx) = std::sync::mpsc::channel();
+        let accept_listener = listener_socket;
+        std::thread::spawn(move || accept_clients(accept_listener, incoming_tx));
 
+        let mut clients: Vec<MatchClient> = Vec::new();
         loop {
-            tick_match_state(false);
-            if websocket {
-                if let Err(errno) = drain_websocket(client_socket) {
-                    if CLIENT_DROPPED.contains(&errno) {
-                        println!(
-                            "[smush_info] websocket client dropped (errno {}), waiting for reconnect",
-                            errno
+            loop {
+                match incoming_rx.try_recv() {
+                    Ok(socket) => {
+                        set_send_timeout(socket, 3);
+                        let _ = set_sock_timeout(socket, SO_RCVTIMEO, 1);
+                        let keepalive: u32 = 1;
+                        setsockopt(
+                            socket,
+                            SOL_SOCKET,
+                            SO_KEEPALIVE,
+                            &keepalive as *const _ as *const c_void,
+                            size_of_val(&keepalive) as u32,
                         );
-                        close_socket_if_open(&mut client_socket);
-                        match accept_link(listener_socket) {
-                            Ok((socket, next_websocket)) => {
-                                client_socket = socket;
-                                websocket = next_websocket;
-                            }
-                            Err(accept_errno) => {
-                                close_socket_if_open(&mut client_socket);
-                                close_socket_if_open(&mut listener_socket);
-                                return Err(accept_errno);
-                            }
-                        }
-                        continue;
+                        clients.push(MatchClient {
+                            socket,
+                            websocket: false,
+                            probing: true,
+                            started: std::time::Instant::now(),
+                            request: Vec::new(),
+                        });
                     }
-                    println!("[smush_info] websocket read failed with errno {}, restarting listener", errno);
-                    close_socket_if_open(&mut client_socket);
-                    close_socket_if_open(&mut listener_socket);
-                    return Err(errno);
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        for client in &mut clients {
+                            drop_client(client);
+                        }
+                        close_socket_if_open(&mut listener_socket);
+                        return Err(54);
+                    }
                 }
             }
-            let payload = serde_json::to_vec(&GAME_INFO).unwrap();
-            let frame = if websocket {
-                text_frame(&payload)
-            } else {
-                let mut data = payload;
-                data.push(b'\n');
-                data
-            };
-            match send_bytes(client_socket, &frame) {
-                Ok(_) => (),
-                Err(errno) if CLIENT_DROPPED.contains(&errno) => {
-                    println!(
-                        "[smush_info] client dropped (errno {}), waiting for reconnect",
-                        errno
-                    );
-                    close_socket_if_open(&mut client_socket);
-                    match accept_link(listener_socket) {
-                        Ok((socket, next_websocket)) => {
-                            client_socket = socket;
-                            websocket = next_websocket;
-                        }
-                        Err(accept_errno) => {
-                            close_socket_if_open(&mut client_socket);
-                            close_socket_if_open(&mut listener_socket);
-                            return Err(accept_errno);
+
+            let mut index = 0;
+            while index < clients.len() {
+                if !clients[index].probing {
+                    index += 1;
+                    continue;
+                }
+                if let Err(errno) = poll_probe(&mut clients[index]) {
+                    println!("[smush_info] client dropped during handshake (errno {})", errno);
+                    drop_client(&mut clients[index]);
+                    clients.swap_remove(index);
+                } else {
+                    index += 1;
+                }
+            }
+
+            if clients.iter().any(|client| !client.probing) {
+                tick_match_state(false);
+                let payload = serde_json::to_vec(&GAME_INFO).unwrap();
+                let websocket_frame = text_frame(&payload);
+                let mut tcp_frame = payload;
+                tcp_frame.push(b'\n');
+                index = 0;
+                while index < clients.len() {
+                    if clients[index].probing {
+                        index += 1;
+                        continue;
+                    }
+                    let sent = if clients[index].websocket {
+                        drain_websocket(clients[index].socket)
+                            .and_then(|_| send_bytes(clients[index].socket, &websocket_frame))
+                    } else {
+                        send_bytes(clients[index].socket, &tcp_frame)
+                    };
+                    match sent {
+                        Ok(()) => index += 1,
+                        Err(errno) => {
+                            println!("[smush_info] client dropped (errno {})", errno);
+                            drop_client(&mut clients[index]);
+                            clients.swap_remove(index);
                         }
                     }
-                }
-                Err(e) => {
-                    println!("[smush_info] send failed with errno {}, restarting listener", e);
-                    close_socket_if_open(&mut client_socket);
-                    close_socket_if_open(&mut listener_socket);
-                    return Err(e);
                 }
             }
             std::thread::sleep(Duration::from_millis(16));
