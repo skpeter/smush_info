@@ -442,7 +442,7 @@ fn is_game_over(is_results: bool, is_match: bool) -> bool {
 }
 
 #[inline(never)]
-fn dump_game_info_snapshot(include_openings: bool) -> bool {
+fn encode_game_info_snapshot(include_openings: bool) -> Option<Vec<u8>> {
     let encoded = if include_openings {
         match serde_json::to_value(&GAME_INFO) {
             Ok(mut value) => {
@@ -459,13 +459,24 @@ fn dump_game_info_snapshot(include_openings: bool) -> bool {
     match encoded {
         Ok(mut data) => {
             data.push(b'\n');
-            results_log::write_snapshot(&data)
+            Some(data)
         }
         Err(e) => {
             println!("[smush_info] results snapshot serialize failed: {}", e);
-            false
+            None
         }
     }
+}
+
+#[inline(never)]
+fn dump_game_info_snapshot(include_openings: bool) -> bool {
+    let Some(data) = encode_game_info_snapshot(include_openings) else {
+        return false;
+    };
+    // Match-end MainThread Data Aborts correlated with CreateFile during results
+    // transition; let the game finish FS work before we touch sd:/smush_info.
+    std::thread::sleep(Duration::from_secs(2));
+    results_log::write_snapshot(&data)
 }
 
 struct MatchTickState {
@@ -631,13 +642,18 @@ unsafe fn update_match_state(state: &mut MatchTickState, on_game_thread: bool) {
             match_feed::set_sampling(true);
         } else {
             match_feed::set_sampling(false);
-            state.stats_was_eligible = false;
-            state.stats_latched = false;
-            state.stats_dumped = false;
-            // Drop any deferred dump so we do not serialize openings from a wiped calculator.
-            state.pending_dump = false;
-            state.pending_openings = false;
-            match_feed::reset(&GAME_INFO);
+            // Do not wipe openings / clear pending while a dump is armed or running —
+            // the 1MB thread may still be encoding STATS.
+            let dump_in_flight =
+                state.pending_dump || LARGE_STACK_FLUSH_SPAWNED.load(Ordering::SeqCst);
+            if !dump_in_flight {
+                state.stats_was_eligible = false;
+                state.stats_latched = false;
+                state.stats_dumped = false;
+                state.pending_dump = false;
+                state.pending_openings = false;
+                match_feed::reset(&GAME_INFO);
+            }
         }
     }
 
@@ -656,6 +672,8 @@ unsafe fn update_match_state(state: &mut MatchTickState, on_game_thread: bool) {
         // Arm only. Flush always runs on the 1MB dump thread (never L2C / TCP / UDP).
         state.pending_dump = true;
         state.pending_openings = state.stats_latched;
+        // Freeze calculator before the dump thread encodes.
+        match_feed::set_sampling(false);
     }
 
     if !is_match {
