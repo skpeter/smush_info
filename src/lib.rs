@@ -364,7 +364,7 @@ unsafe fn update_match_state(state: &mut MatchTickState) {
     } else {
         *(FIGHTER_MANAGER_ADDR as *mut *mut app::FighterManager)
     };
-    let current_menu: u32 = *(offset_to_addr(0x53050f0) as *const u32); // 13.0.5 (was 0x53040f0 on 13.0.4)
+    let current_menu: u32 = *(offset_to_addr(MENU_OFFSET) as *const u32);
     const CONTROLS_SCREEN_MENU: u32 = 0x6020000; //is_match is set to true when the player in the controls screen, i assume because there is a sandbag and mario. this ensures we're not in the controls screen
     const MII_MAKER_MENU: u32 = 0x4050000; //performs same check to make sure we're not on mii maker
     let menu_is_gameplay = current_menu != CONTROLS_SCREEN_MENU && current_menu != MII_MAKER_MENU;
@@ -662,15 +662,55 @@ pub unsafe fn set_player_information(module_accessor: &mut app::BattleObjectModu
     GAME_INFO.players[player_num].name.store_str(Some(&get_tag_of_player(player_num)), Ordering::SeqCst);
 }
 
-// 13.0.5: UPDATE_TAG unchanged; PLAYER_SAVE/PLAYER_TAG +0x1000 vs 13.0.4 (HDR / neighbor slide)
+// UPDATE_TAG unchanged across 13.0.4/13.0.5. Data offsets slide +0x1000 on 13.0.5;
+// stage select is a code offset (+0x450). Defaults are 13.0.5; apply_version_offsets()
+// rewinds them for older display versions.
 static UPDATE_TAG_FOR_PLAYER_OFFSET: usize = 0x19fd0b0;
-static PLAYER_SAVE_OFFSET: usize = 0x5314510;
+static mut PLAYER_SAVE_OFFSET: usize = 0x5314510;
 static mut PLAYER_SAVE_ADDRESS: *const u64 = 0x0 as *const u64;
+static mut PLAYER_TAG_OFFSET: usize = 0x52C5758;
+static mut MENU_OFFSET: usize = 0x53050f0;
+static mut STAGE_SELECTED_OFFSET: usize = 0x23355d4;
 
-static PLAYER_TAG_OFFSET: usize = 0x52C5758; // predicted +0x1000; confirm on console
+fn display_version() -> String {
+    skyline::nn::oe::get_display_version()
+}
+
+fn parse_display_version(s: &str) -> Option<(u32, u32, u32)> {
+    let mut parts = s.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts.next()?.parse().ok()?;
+    Some((major, minor, patch))
+}
+
+/// True for 13.0.5 and newer. Unknown/unparseable versions keep the 13.0.5 offsets.
+fn uses_13_0_5_offsets(version: &str) -> bool {
+    match parse_display_version(version) {
+        Some(v) => v >= (13, 0, 5),
+        None => true,
+    }
+}
+
+unsafe fn apply_version_offsets() {
+    let version = display_version();
+    if uses_13_0_5_offsets(&version) {
+        PLAYER_SAVE_OFFSET = 0x5314510;
+        PLAYER_TAG_OFFSET = 0x52C5758;
+        MENU_OFFSET = 0x53050f0;
+        STAGE_SELECTED_OFFSET = 0x23355d4;
+        println!("[smush_info] game {} — using 13.0.5 offsets", version);
+    } else {
+        PLAYER_SAVE_OFFSET = 0x5313510;
+        PLAYER_TAG_OFFSET = 0x52C4758;
+        MENU_OFFSET = 0x53040f0;
+        STAGE_SELECTED_OFFSET = 0x2335184;
+        println!("[smush_info] game {} — using 13.0.4 offsets", version);
+    }
+}
 
 pub fn get_tag_of_player(player_index: usize) -> String {
-    let player_tag_offset = PLAYER_TAG_OFFSET + (player_index * 0x260);
+    let player_tag_offset = unsafe { PLAYER_TAG_OFFSET } + (player_index * 0x260);
     let player_tag_addr: *const u16 = offset_to_addr(player_tag_offset) as *const u16;
     
     unsafe {
@@ -814,7 +854,7 @@ fn server_supervisor() {
     }
 }
 
-#[skyline::hook(offset = 0x23355d4, inline)] // 13.0.5 (was 0x2335184 on 13.0.4)
+#[skyline::hook(offset = STAGE_SELECTED_OFFSET, inline)]
 unsafe fn selected_stage(_ctx: &InlineCtx) {
     println!("stage has been selected");
     GAME_INFO.is_results_screen.store(false, Ordering::SeqCst);
@@ -896,6 +936,7 @@ pub fn main() {
             &raw mut FIGHTER_MANAGER_ADDR,
             "_ZN3lib9SingletonIN3app14FighterManagerEE9instance_E\u{0}".as_bytes().as_ptr(),
         );
+        apply_version_offsets();
     }
 
     search_offsets();
