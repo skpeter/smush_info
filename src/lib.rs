@@ -260,8 +260,9 @@ unsafe extern "C" fn once_per_frame_per_fighter(fighter: &mut SmashlineFighterCo
     let screen_pos = as_pixels(pos);
     GAME_INFO.players[player_num].x.store(screen_pos.x, Ordering::SeqCst);
     GAME_INFO.players[player_num].y.store(screen_pos.y, Ordering::SeqCst);
-    // Game thread stack is ~1MB. Rust plugin threads are 64KB and abort if dump/serde inlines in.
-    // The gate runs before the sample so a new match clears stale slots first.
+    // Never serde / SD-write / prune on the smashline L2C thread — that path crashed
+    // (UndefInstr in results_log::prune_oldest). Always hand off to the 1MB dump thread.
+    // Tick before capture so a new match clears stale slots first.
     // Tick/flush on the lower active entry id (not hard-coded port 0).
     let owns_tick = match_feed::is_tick_owner(player_num, &GAME_INFO);
     if owns_tick {
@@ -269,7 +270,7 @@ unsafe extern "C" fn once_per_frame_per_fighter(fighter: &mut SmashlineFighterCo
     }
     match_feed::capture(module_accessor, player_num);
     if owns_tick {
-        flush_match_snapshot();
+        request_large_stack_flush();
     }
 }
 
@@ -499,8 +500,18 @@ lazy_static! {
 
 static LARGE_STACK_FLUSH_SPAWNED: AtomicBool = AtomicBool::new(false);
 
-/// Plugin TCP/UDP threads are ~64KB and abort on openings serde. Spawn 1MB.
+/// Openings serde + SD write + prune must not run on L2C or 64KB plugin threads. Spawn 1MB.
 fn request_large_stack_flush() {
+    let pending = {
+        let state = match MATCH_TICK.lock() {
+            Ok(s) => s,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        state.pending_dump
+    };
+    if !pending {
+        return;
+    }
     if LARGE_STACK_FLUSH_SPAWNED.swap(true, Ordering::SeqCst) {
         return;
     }
@@ -642,8 +653,7 @@ unsafe fn update_match_state(state: &mut MatchTickState, on_game_thread: bool) {
         if is_results {
             GAME_INFO.is_results_screen.store(true, Ordering::SeqCst);
         }
-        // Arm only. Flush runs outside this lock: game thread after tick, or a 1MB
-        // dump thread when TCP/UDP is the only writer left.
+        // Arm only. Flush always runs on the 1MB dump thread (never L2C / TCP / UDP).
         state.pending_dump = true;
         state.pending_openings = state.stats_latched;
     }
