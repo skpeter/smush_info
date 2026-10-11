@@ -6,24 +6,28 @@ use skyline::from_c_str;
 use skyline::libc::*;
 use std::time::Duration;
 use std::mem::size_of_val;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 
 use smash::app;
 use smash::app::lua_bind::*;
 use smash::lib::lua_const::*;
 use smash::lib::L2CValue;
 
-use smush_info_shared::{Character, Info};
+use smush_info_shared::{handshake_response, should_write_stats_snapshot, text_frame, Character, Info};
+use lazy_static::lazy_static;
 
 use smash::Vector3f;
 use smash::Vector2f;
 
 use smashline::{
-    original_status, Agent, CheckDamage, L2CFighterCommon as SmashlineFighterCommon, Main, Pre,
+    original_status, Agent, CheckDamage, ExecStop, L2CFighterCommon as SmashlineFighterCommon,
+    Main, Pre,
 };
 
 mod conversions;
 use conversions::{kind_to_char, stage_id_to_stage};
+mod match_feed;
 mod results_log;
 mod udp;
 
@@ -61,15 +65,20 @@ extern "C" {
     pub fn world_to_screen(vec: *const Vector3f, unk: bool) -> Float32x2;
 }
 
-fn send_bytes(socket: i32, bytes: &[u8]) -> Result<(), i64> {
-    unsafe {
-        let ret = send(socket, bytes.as_ptr() as *const _, bytes.len(), 0);
-        if ret < 0 {
-            Err(*errno_loc())
-        } else {
-            Ok(())
+fn send_bytes(socket: i32, mut bytes: &[u8]) -> Result<(), i64> {
+    while !bytes.is_empty() {
+        unsafe {
+            let ret = send(socket, bytes.as_ptr() as *const _, bytes.len(), 0);
+            if ret > 0 {
+                bytes = &bytes[ret as usize..];
+            } else if ret == 0 {
+                return Err(32);
+            } else {
+                return Err(*errno_loc());
+            }
         }
     }
+    Ok(())
 }
 
 fn close_socket_if_open(socket: &mut i32) {
@@ -81,8 +90,10 @@ fn close_socket_if_open(socket: &mut i32) {
     }
 }
 
-// SO_SNDTIMEO (BSD-style) so send() fails after a few seconds on dead connections (e.g. after suspend).
+// SO_SNDTIMEO / SO_RCVTIMEO (BSD-style) so send() fails after a few seconds on dead
+// connections, and a quiet client can be told apart from a browser upgrade.
 const SO_SNDTIMEO: i32 = 0x1005;
+const SO_RCVTIMEO: i32 = 0x1006;
 
 #[repr(C)]
 struct timeval {
@@ -90,22 +101,118 @@ struct timeval {
     tv_usec: i64,
 }
 
-fn set_send_timeout(socket: i32, secs: i64) {
+fn set_sock_timeout(socket: i32, option: i32, millis: i64) -> bool {
     unsafe {
         let tv = timeval {
-            tv_sec: secs,
-            tv_usec: 0,
+            tv_sec: millis / 1000,
+            tv_usec: (millis % 1000) * 1000,
         };
-        if setsockopt(
+        setsockopt(
             socket,
             SOL_SOCKET,
-            SO_SNDTIMEO,
+            option,
             &tv as *const _ as *const c_void,
             size_of_val(&tv) as u32,
-        ) < 0
-        {
-            let e = *errno_loc();
-            println!("[smush_info] setsockopt SO_SNDTIMEO failed (errno {}), continuing without send timeout", e);
+        ) == 0
+    }
+}
+
+fn set_send_timeout(socket: i32, secs: i64) {
+    if !set_sock_timeout(socket, SO_SNDTIMEO, secs * 1000) {
+        let e = unsafe { *errno_loc() };
+        println!("[smush_info] setsockopt SO_SNDTIMEO failed (errno {}), continuing without send timeout", e);
+    }
+}
+
+fn recv_some(socket: i32, buf: &mut [u8]) -> Result<Option<usize>, i64> {
+    unsafe {
+        let n = recv(socket, buf.as_mut_ptr() as *mut _, buf.len(), 0);
+        if n > 0 {
+            Ok(Some(n as usize))
+        } else if n == 0 {
+            Err(54)
+        } else {
+            let err = *errno_loc();
+            if err == 11 || err == 60 {
+                Ok(None)
+            } else {
+                Err(err)
+            }
+        }
+    }
+}
+
+struct MatchClient {
+    socket: i32,
+    websocket: bool,
+    probing: bool,
+    started: std::time::Instant,
+    request: Vec<u8>,
+}
+
+fn drop_client(client: &mut MatchClient) {
+    close_socket_if_open(&mut client.socket);
+}
+
+/// Browser clients send an upgrade immediately. Raw TCP clients send nothing.
+fn poll_probe(client: &mut MatchClient) -> Result<(), i64> {
+    let mut tmp = [0u8; 512];
+    match recv_some(client.socket, &mut tmp)? {
+        Some(n) => {
+            client.request.extend_from_slice(&tmp[..n]);
+            if client.request.windows(4).any(|w| w == b"\r\n\r\n") || client.request.len() >= 2048 {
+                finish_probe(client)?;
+            }
+            Ok(())
+        }
+        None => {
+            if client.request.is_empty() && client.started.elapsed() >= Duration::from_millis(200) {
+                client.probing = false;
+                client.websocket = false;
+                println!("[smush_info] tcp client connected");
+            } else if !client.request.is_empty() && client.started.elapsed() >= Duration::from_millis(200) {
+                return Err(60);
+            }
+            Ok(())
+        }
+    }
+}
+
+fn finish_probe(client: &mut MatchClient) -> Result<(), i64> {
+    let text = String::from_utf8_lossy(&client.request);
+    let Some(response) = handshake_response(&text) else {
+        println!("[smush_info] closing client that did not request a websocket");
+        return Err(32);
+    };
+    send_bytes(client.socket, response.as_bytes())?;
+    client.request.clear();
+    client.probing = false;
+    client.websocket = true;
+    println!("[smush_info] websocket client connected");
+    Ok(())
+}
+
+fn drain_websocket(socket: i32) -> Result<(), i64> {
+    let mut tmp = [0u8; 256];
+    loop {
+        if recv_some(socket, &mut tmp)?.is_none() {
+            return Ok(());
+        }
+    }
+}
+
+fn accept_clients(listener_socket: i32, incoming: std::sync::mpsc::Sender<i32>) {
+    loop {
+        match accept_client_socket(listener_socket) {
+            Ok(socket) => {
+                if incoming.send(socket).is_err() {
+                    unsafe {
+                        close(socket);
+                    }
+                    break;
+                }
+            }
+            Err(_) => break,
         }
     }
 }
@@ -153,15 +260,24 @@ unsafe extern "C" fn once_per_frame_per_fighter(fighter: &mut SmashlineFighterCo
     let screen_pos = as_pixels(pos);
     GAME_INFO.players[player_num].x.store(screen_pos.x, Ordering::SeqCst);
     GAME_INFO.players[player_num].y.store(screen_pos.y, Ordering::SeqCst);
-    // Game thread stack is ~1MB. Rust plugin threads are 64KB and abort if dump/serde inlines in.
-    if player_num == 0 {
-        tick_match_state();
+    // Never serde / SD-write / prune on the smashline L2C thread — that path crashed
+    // (UndefInstr in results_log::prune_oldest). Always hand off to the 1MB dump thread.
+    // Tick before capture so a new match clears stale slots first.
+    // Tick/flush on the lower active entry id (not hard-coded port 0).
+    let owns_tick = match_feed::is_tick_owner(player_num, &GAME_INFO);
+    if owns_tick {
+        tick_match_state(true);
+    }
+    match_feed::capture(module_accessor, player_num);
+    if owns_tick {
+        request_large_stack_flush();
     }
 }
 
 fn install_fighter_frame_hook() {
     Agent::new("fighter")
         .on_line(Main, once_per_frame_per_fighter)
+        .on_line(ExecStop, once_per_frame_per_fighter)
         .install();
 }
 
@@ -220,7 +336,11 @@ fn install_fighter_status_hooks() {
 }
 
 
-static GAME_INFO: Info = Info::new();
+pub(crate) static GAME_INFO: Info = Info::new();
+
+pub(crate) fn game_info() -> &'static Info {
+    &GAME_INFO
+}
 
 const MATCH_TICK_MS: u64 = 16;
 const SNAPSHOT_COOLDOWN_TICKS: u64 = 120_000 / MATCH_TICK_MS;
@@ -322,40 +442,153 @@ fn is_game_over(is_results: bool, is_match: bool) -> bool {
 }
 
 #[inline(never)]
-fn dump_game_info_snapshot() -> bool {
-    match serde_json::to_vec(&GAME_INFO) {
+fn encode_game_info_snapshot(include_openings: bool) -> Option<Vec<u8>> {
+    let encoded = if include_openings {
+        match serde_json::to_value(&GAME_INFO) {
+            Ok(mut value) => {
+                if let Some(object) = value.as_object_mut() {
+                    object.insert("openings".to_string(), match_feed::openings_json());
+                }
+                serde_json::to_vec(&value)
+            }
+            Err(e) => Err(e),
+        }
+    } else {
+        serde_json::to_vec(&GAME_INFO)
+    };
+    match encoded {
         Ok(mut data) => {
             data.push(b'\n');
-            results_log::write_snapshot(&data)
+            Some(data)
         }
         Err(e) => {
             println!("[smush_info] results snapshot serialize failed: {}", e);
-            false
+            None
         }
     }
+}
+
+#[inline(never)]
+fn dump_game_info_snapshot(include_openings: bool) -> bool {
+    let Some(data) = encode_game_info_snapshot(include_openings) else {
+        return false;
+    };
+    // Match-end MainThread Data Aborts correlated with CreateFile during results
+    // transition; let the game finish FS work before we touch sd:/smush_info.
+    std::thread::sleep(Duration::from_secs(2));
+    results_log::write_snapshot(&data)
 }
 
 struct MatchTickState {
     prev_game_over: bool,
     saw_match: bool,
     ticks_since_dump: u64,
+    stats_was_eligible: bool,
+    stats_latched: bool,
+    stats_dumped: bool,
+    pending_dump: bool,
+    pending_openings: bool,
 }
 
-static mut MATCH_TICK: MatchTickState = MatchTickState {
-    prev_game_over: false,
-    saw_match: false,
-    ticks_since_dump: SNAPSHOT_COOLDOWN_TICKS,
-};
+impl MatchTickState {
+    const fn new() -> Self {
+        Self {
+            prev_game_over: false,
+            saw_match: false,
+            ticks_since_dump: SNAPSHOT_COOLDOWN_TICKS,
+            stats_was_eligible: false,
+            stats_latched: false,
+            stats_dumped: false,
+            pending_dump: false,
+            pending_openings: false,
+        }
+    }
+}
 
-#[inline(never)]
-fn tick_match_state() {
-    unsafe {
-        update_match_state(&mut MATCH_TICK);
+lazy_static! {
+    static ref MATCH_TICK: Mutex<MatchTickState> = Mutex::new(MatchTickState::new());
+}
+
+static LARGE_STACK_FLUSH_SPAWNED: AtomicBool = AtomicBool::new(false);
+
+/// Openings serde + SD write + prune must not run on L2C or 64KB plugin threads. Spawn 1MB.
+fn request_large_stack_flush() {
+    let pending = {
+        let state = match MATCH_TICK.lock() {
+            Ok(s) => s,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        state.pending_dump
+    };
+    if !pending {
+        return;
+    }
+    if LARGE_STACK_FLUSH_SPAWNED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let spawn = std::thread::Builder::new()
+        .name("smush_stats_dump".into())
+        .stack_size(1024 * 1024)
+        .spawn(|| {
+            flush_match_snapshot();
+            LARGE_STACK_FLUSH_SPAWNED.store(false, Ordering::SeqCst);
+        });
+    if let Err(e) = spawn {
+        println!("[smush_info] stats dump thread spawn failed: {}", e);
+        LARGE_STACK_FLUSH_SPAWNED.store(false, Ordering::SeqCst);
     }
 }
 
 #[inline(never)]
-unsafe fn update_match_state(state: &mut MatchTickState) {
+fn flush_match_snapshot() {
+    let (pending, include_openings) = {
+        let state = match MATCH_TICK.lock() {
+            Ok(s) => s,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if !state.pending_dump {
+            return;
+        }
+        (true, state.pending_openings)
+    };
+    if !pending {
+        return;
+    }
+    // Do not hold MATCH_TICK across serde / SD write.
+    let dump: fn(bool) -> bool = dump_game_info_snapshot;
+    let ok = std::hint::black_box(dump)(include_openings);
+    let mut state = match MATCH_TICK.lock() {
+        Ok(s) => s,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if ok {
+        state.ticks_since_dump = 0;
+        state.pending_dump = false;
+        if include_openings {
+            state.stats_dumped = true;
+        }
+    }
+}
+
+#[inline(never)]
+fn tick_match_state(on_game_thread: bool) {
+    let need_fallback_flush = {
+        let mut state = match MATCH_TICK.lock() {
+            Ok(s) => s,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        unsafe {
+            update_match_state(&mut state, on_game_thread);
+        }
+        state.pending_dump && !on_game_thread
+    };
+    if need_fallback_flush {
+        request_large_stack_flush();
+    }
+}
+
+#[inline(never)]
+unsafe fn update_match_state(state: &mut MatchTickState, on_game_thread: bool) {
     // FighterManager singleton may not exist yet (early in app boot, before title screen)
     // and FIGHTER_MANAGER_ADDR can be 0 if LookupSymbol failed. Treat both as "no match"
     // to avoid dereferencing a null this-pointer in entry_count/is_result_mode.
@@ -384,14 +617,63 @@ unsafe fn update_match_state(state: &mut MatchTickState) {
     }
 
     let game_over = state.saw_match && is_game_over(is_results, is_match);
-    if game_over && !state.prev_game_over && state.ticks_since_dump >= SNAPSHOT_COOLDOWN_TICKS {
+    // gstack-shortcut(dec-6ea7e982-17b2-4d92-824f-8fa6f2edd87d): 6/10, upgrade when Spirits, Classic, and World of Light menu ids are known
+    let entry_count = if mgr.is_null() {
+        0
+    } else {
+        FighterManager::entry_count(mgr)
+    };
+    let training = app::smashball::is_training_mode();
+    let ice_climbers = (0..8).any(|slot| {
+        let player = &GAME_INFO.players[slot];
+        player.is_in_game.load(Ordering::SeqCst) && is_ice_climbers(player.character.load(Ordering::SeqCst))
+    });
+    let eligible = is_match && entry_count == 2 && !training && !ice_climbers;
+    if on_game_thread {
+        if is_results {
+            match_feed::set_sampling(false);
+        } else if eligible {
+            if !state.stats_was_eligible {
+                match_feed::reset(&GAME_INFO);
+                state.stats_dumped = false;
+                state.stats_latched = true;
+                state.stats_was_eligible = true;
+            }
+            match_feed::set_sampling(true);
+        } else {
+            match_feed::set_sampling(false);
+            // Do not wipe openings / clear pending while a dump is armed or running —
+            // the 1MB thread may still be encoding STATS.
+            let dump_in_flight =
+                state.pending_dump || LARGE_STACK_FLUSH_SPAWNED.load(Ordering::SeqCst);
+            if !dump_in_flight {
+                state.stats_was_eligible = false;
+                state.stats_latched = false;
+                state.stats_dumped = false;
+                state.pending_dump = false;
+                state.pending_openings = false;
+                match_feed::reset(&GAME_INFO);
+            }
+        }
+    }
+
+    let game_over_edge = game_over && !state.prev_game_over;
+    let latched_write = state.stats_latched && !state.stats_dumped;
+    let write_edge = game_over_edge || (latched_write && game_over);
+    if should_write_stats_snapshot(
+        latched_write,
+        write_edge,
+        state.ticks_since_dump,
+        SNAPSHOT_COOLDOWN_TICKS,
+    ) {
         if is_results {
             GAME_INFO.is_results_screen.store(true, Ordering::SeqCst);
         }
-        let dump: fn() -> bool = dump_game_info_snapshot;
-        if std::hint::black_box(dump)() {
-            state.ticks_since_dump = 0;
-        }
+        // Arm only. Flush always runs on the 1MB dump thread (never L2C / TCP / UDP).
+        state.pending_dump = true;
+        state.pending_openings = state.stats_latched;
+        // Freeze calculator before the dump thread encodes.
+        match_feed::set_sampling(false);
     }
 
     if !is_match {
@@ -475,42 +757,87 @@ fn start_server() -> Result<(), i64> {
             size_of_val(&server_addr) as u32,
         ));
 
-        dbg_err!(listen(listener_socket, 1));
-        println!("[smush_info] tcp server listening on 4242");
-        client_socket = accept_client_socket(listener_socket)?;
-        set_send_timeout(client_socket, 3);
-        println!("[smush_info] tcp client connected");
+        dbg_err!(listen(listener_socket, 8));
+        println!("[smush_info] match socket listening on 4242");
+        let (incoming_tx, incoming_rx) = std::sync::mpsc::channel();
+        let accept_listener = listener_socket;
+        std::thread::spawn(move || accept_clients(accept_listener, incoming_tx));
 
-
+        let mut clients: Vec<MatchClient> = Vec::new();
         loop {
-            tick_match_state();
-            let mut data = serde_json::to_vec(&GAME_INFO).unwrap();
-            data.push(b'\n');
-            match send_bytes(client_socket, &data) {
-                Ok(_) => (),
-                Err(errno) if matches!(errno, 11 | 32 | 53 | 54 | 57 | 60) => {
-                    println!(
-                        "[smush_info] tcp client dropped (errno {}), waiting for reconnect",
-                        errno
-                    );
-                    close_socket_if_open(&mut client_socket);
-                    match accept_client_socket(listener_socket) {
-                        Ok(socket) => {
-                            client_socket = socket;
-                            println!("[smush_info] tcp client connected");
+            loop {
+                match incoming_rx.try_recv() {
+                    Ok(socket) => {
+                        set_send_timeout(socket, 3);
+                        let _ = set_sock_timeout(socket, SO_RCVTIMEO, 1);
+                        let keepalive: u32 = 1;
+                        setsockopt(
+                            socket,
+                            SOL_SOCKET,
+                            SO_KEEPALIVE,
+                            &keepalive as *const _ as *const c_void,
+                            size_of_val(&keepalive) as u32,
+                        );
+                        clients.push(MatchClient {
+                            socket,
+                            websocket: false,
+                            probing: true,
+                            started: std::time::Instant::now(),
+                            request: Vec::new(),
+                        });
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        for client in &mut clients {
+                            drop_client(client);
                         }
-                        Err(accept_errno) => {
-                            close_socket_if_open(&mut client_socket);
-                            close_socket_if_open(&mut listener_socket);
-                            return Err(accept_errno);
-                        }
+                        close_socket_if_open(&mut listener_socket);
+                        return Err(54);
                     }
                 }
-                Err(e) => {
-                    println!("[smush_info] tcp send failed with errno {}, restarting listener", e);
-                    close_socket_if_open(&mut client_socket);
-                    close_socket_if_open(&mut listener_socket);
-                    return Err(e);
+            }
+
+            let mut index = 0;
+            while index < clients.len() {
+                if !clients[index].probing {
+                    index += 1;
+                    continue;
+                }
+                if let Err(errno) = poll_probe(&mut clients[index]) {
+                    println!("[smush_info] client dropped during handshake (errno {})", errno);
+                    drop_client(&mut clients[index]);
+                    clients.swap_remove(index);
+                } else {
+                    index += 1;
+                }
+            }
+
+            if clients.iter().any(|client| !client.probing) {
+                tick_match_state(false);
+                let payload = serde_json::to_vec(&GAME_INFO).unwrap();
+                let websocket_frame = text_frame(&payload);
+                let mut tcp_frame = payload;
+                tcp_frame.push(b'\n');
+                index = 0;
+                while index < clients.len() {
+                    if clients[index].probing {
+                        index += 1;
+                        continue;
+                    }
+                    let sent = if clients[index].websocket {
+                        drain_websocket(clients[index].socket)
+                            .and_then(|_| send_bytes(clients[index].socket, &websocket_frame))
+                    } else {
+                        send_bytes(clients[index].socket, &tcp_frame)
+                    };
+                    match sent {
+                        Ok(()) => index += 1,
+                        Err(errno) => {
+                            println!("[smush_info] client dropped (errno {})", errno);
+                            drop_client(&mut clients[index]);
+                            clients.swap_remove(index);
+                        }
+                    }
                 }
             }
             std::thread::sleep(Duration::from_millis(16));
@@ -924,13 +1251,16 @@ fn udp_broadcast_loop() {
         std::thread::sleep(std::time::Duration::from_secs(1));
         udp::broadcast_device_info();
         // 1Hz results fallback when no overlay and no fighter frames (e.g. IC → results).
-        let tick: fn() = tick_match_state;
-        std::hint::black_box(tick)();
+        let tick: fn(bool) = tick_match_state;
+        std::hint::black_box(tick)(false);
     }
 }
 
 #[skyline::main(name = "smush_info")]
 pub fn main() {
+    // The sheet is parsed on the first real lookup. Do that here, on the load
+    // thread, so the first hit of a session does not stall the game thread.
+    smush_info_shared::preload_move_names();
     unsafe {
         skyline::nn::ro::LookupSymbol(
             &raw mut FIGHTER_MANAGER_ADDR,
