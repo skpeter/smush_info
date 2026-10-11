@@ -11,7 +11,6 @@ use std::sync::atomic::Ordering;
 use smash::app;
 use smash::app::lua_bind::*;
 use smash::lib::lua_const::*;
-use smash::lua2cpp::{L2CFighterCommon, L2CFighterCommon_status_pre_Rebirth, L2CFighterCommon_status_pre_Entry, L2CFighterCommon_sub_damage_uniq_process_init, L2CFighterCommon_status_pre_Dead};
 use smash::lib::L2CValue;
 
 use smush_info_shared::{Character, Info};
@@ -19,7 +18,9 @@ use smush_info_shared::{Character, Info};
 use smash::Vector3f;
 use smash::Vector2f;
 
-use smashline::{Agent, L2CFighterCommon as SmashlineFighterCommon, Main};
+use smashline::{
+    original_status, Agent, CheckDamage, L2CFighterCommon as SmashlineFighterCommon, Main, Pre,
+};
 
 mod conversions;
 use conversions::{kind_to_char, stage_id_to_stage};
@@ -161,6 +162,60 @@ unsafe extern "C" fn once_per_frame_per_fighter(fighter: &mut SmashlineFighterCo
 fn install_fighter_frame_hook() {
     Agent::new("fighter")
         .on_line(Main, once_per_frame_per_fighter)
+        .install();
+}
+
+// Smashline status scripts — skyline `replace = L2CFighterCommon_*` on common NRO
+// crashes on 13.0.5 when Smashline is loaded.
+unsafe extern "C" fn handle_pre_entry(fighter: &mut SmashlineFighterCommon) -> L2CValue {
+    let module_accessor = app::sv_system::battle_object_module_accessor(fighter.lua_state_agent);
+    set_player_information(module_accessor);
+    GAME_INFO
+        .stage
+        .store(stage_id_to_stage(stage_id()) as u32, Ordering::SeqCst);
+    original_status(Pre, fighter, *FIGHTER_STATUS_KIND_ENTRY)(fighter)
+}
+
+unsafe extern "C" fn handle_pre_rebirth(fighter: &mut SmashlineFighterCommon) -> L2CValue {
+    let module_accessor = app::sv_system::battle_object_module_accessor(fighter.lua_state_agent);
+    set_player_information(module_accessor);
+    original_status(Pre, fighter, *FIGHTER_STATUS_KIND_REBIRTH)(fighter)
+}
+
+unsafe extern "C" fn handle_pre_dead(fighter: &mut SmashlineFighterCommon) -> L2CValue {
+    let module_accessor = app::sv_system::battle_object_module_accessor(fighter.lua_state_agent);
+    let entry_id =
+        WorkModule::get_int(module_accessor, *FIGHTER_INSTANCE_WORK_ID_INT_ENTRY_ID) as i32;
+    let player_num = entry_id as usize;
+    if player_num < GAME_INFO.players.len() && FIGHTER_MANAGER_ADDR != 0 {
+        let mgr = *(FIGHTER_MANAGER_ADDR as *mut *mut app::FighterManager);
+        let fighter_information = FighterManager::get_fighter_information(
+            mgr,
+            app::FighterEntryID(entry_id),
+        ) as *mut app::FighterInformation;
+        let stock_count =
+            (FighterInformation::stock_count(fighter_information) as u32).saturating_sub(1);
+        GAME_INFO.players[player_num]
+            .stocks
+            .store(stock_count, Ordering::SeqCst);
+    }
+    original_status(Pre, fighter, *FIGHTER_STATUS_KIND_DEAD)(fighter)
+}
+
+unsafe extern "C" fn handle_check_damage(
+    fighter: &mut SmashlineFighterCommon,
+    _damage: &L2CValue,
+) {
+    let module_accessor = app::sv_system::battle_object_module_accessor(fighter.lua_state_agent);
+    set_player_information(module_accessor);
+}
+
+fn install_fighter_status_hooks() {
+    Agent::new("fighter")
+        .status(Pre, *FIGHTER_STATUS_KIND_ENTRY, handle_pre_entry)
+        .status(Pre, *FIGHTER_STATUS_KIND_REBIRTH, handle_pre_rebirth)
+        .status(Pre, *FIGHTER_STATUS_KIND_DEAD, handle_pre_dead)
+        .on_line(CheckDamage, handle_check_damage)
         .install();
 }
 
@@ -607,68 +662,6 @@ pub unsafe fn set_player_information(module_accessor: &mut app::BattleObjectModu
     GAME_INFO.players[player_num].name.store_str(Some(&get_tag_of_player(player_num)), Ordering::SeqCst);
 }
 
-#[skyline::hook(replace = L2CFighterCommon_status_pre_Entry)]
-pub unsafe fn handle_pre_entry(fighter: &mut L2CFighterCommon) -> L2CValue {
-    let module_accessor = app::sv_system::battle_object_module_accessor(fighter.lua_state_agent);
-    set_player_information(module_accessor);
-
-    GAME_INFO.stage.store(stage_id_to_stage(stage_id()) as u32, Ordering::SeqCst);
-
-    original!()(fighter)
-}
-
-#[skyline::hook(replace = L2CFighterCommon_status_pre_Rebirth)]
-pub unsafe fn handle_pre_rebirth(fighter: &mut L2CFighterCommon) -> L2CValue {
-    let module_accessor = app::sv_system::battle_object_module_accessor(fighter.lua_state_agent);
-    set_player_information(module_accessor);
-
-    original!()(fighter)
-}
-
-#[skyline::hook(replace = L2CFighterCommon_status_pre_Dead)]
-pub unsafe fn handle_pre_dead(fighter: &mut L2CFighterCommon) -> L2CValue { // this kinda fucking sucks but whatever
-    let module_accessor = app::sv_system::battle_object_module_accessor(fighter.lua_state_agent);
-
-    let entry_id = WorkModule::get_int(module_accessor, *FIGHTER_INSTANCE_WORK_ID_INT_ENTRY_ID) as i32;
-    let player_num = entry_id as usize;
-    let mgr = *(FIGHTER_MANAGER_ADDR as *mut *mut app::FighterManager);
-    let fighter_information = FighterManager::get_fighter_information(
-        mgr, 
-        app::FighterEntryID(entry_id)
-    ) as *mut app::FighterInformation;
-
-    let stock_count = (FighterInformation::stock_count(fighter_information) as u32) - 1;
-    GAME_INFO.players[player_num].stocks.store(stock_count, Ordering::SeqCst);
-
-    println!("ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ WE CALLED L2CFighterCommon_status_pre_Dead AND ATTEMPTED TO SET STOCK COUNT TO {}", stock_count);
-    // set_player_information(module_accessor);
-
-    original!()(fighter)
-}
-
-#[skyline::hook(replace = L2CFighterCommon_sub_damage_uniq_process_init)]
-pub unsafe fn handle_sub_damage_uniq_process_init(fighter: &mut L2CFighterCommon) -> L2CValue {
-    let module_accessor = app::sv_system::battle_object_module_accessor(fighter.lua_state_agent);
-    set_player_information(module_accessor);
-
-    original!()(fighter)
-}
-
-fn nro_main(nro: &skyline::nro::NroInfo<'_>) {
-    match nro.name {
-        "common" => {
-            skyline::install_hooks!(
-                handle_pre_entry,
-                handle_pre_rebirth,
-                handle_sub_damage_uniq_process_init,
-                handle_pre_dead
-            );
-        }
-        _ => (),
-    }
-}
-
-
 // 13.0.5: UPDATE_TAG unchanged; PLAYER_SAVE/PLAYER_TAG +0x1000 vs 13.0.4 (HDR / neighbor slide)
 static UPDATE_TAG_FOR_PLAYER_OFFSET: usize = 0x19fd0b0;
 static PLAYER_SAVE_OFFSET: usize = 0x5314510;
@@ -896,16 +889,18 @@ fn udp_broadcast_loop() {
     }
 }
 
-#[skyline::main(name = "discord_server")]
+#[skyline::main(name = "smush_info")]
 pub fn main() {
-    search_offsets();
-    skyline::nro::add_hook(nro_main).unwrap();
     unsafe {
-        PLAYER_SAVE_ADDRESS = offset_to_addr(PLAYER_SAVE_OFFSET) as *const u64;
         skyline::nn::ro::LookupSymbol(
             &raw mut FIGHTER_MANAGER_ADDR,
             "_ZN3lib9SingletonIN3app14FighterManagerEE9instance_E\u{0}".as_bytes().as_ptr(),
         );
+    }
+
+    search_offsets();
+    unsafe {
+        PLAYER_SAVE_ADDRESS = offset_to_addr(PLAYER_SAVE_OFFSET) as *const u64;
         let text_ptr = getRegionAddress(Region::Text) as *const u8;
         let text_size = (getRegionAddress(Region::Rodata) as usize) - (text_ptr as usize);
         let text = std::slice::from_raw_parts(text_ptr, text_size);
@@ -919,6 +914,7 @@ pub fn main() {
             OFFSET3 = offset;
         }
     }
+
     skyline::install_hooks!(
         some_strlen_thing,
         close_arena,
@@ -931,6 +927,7 @@ pub fn main() {
         special_lw_select_index_hook
     );
     install_fighter_frame_hook();
+    install_fighter_status_hooks();
 
     std::thread::spawn(server_supervisor);
 
