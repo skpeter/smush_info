@@ -8,3 +8,5 @@ dist/
 smush_info-sd.zip
 .cursor/hooks/state/continual-learning-index.json
 .cursor/hooks/state/continual-learning.json
+.gstack-review*
+AGENTS.md
