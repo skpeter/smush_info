@@ -13,7 +13,10 @@ use smash::app::lua_bind::*;
 use smash::lib::lua_const::*;
 use smash::lib::L2CValue;
 
-use smush_info_shared::{handshake_response, should_write_stats_snapshot, text_frame, Character, Info};
+use smush_info_shared::{
+    handshake_response, should_arm_clock_zero, should_write_stats_snapshot, text_frame, Character,
+    Info,
+};
 use lazy_static::lazy_static;
 
 
@@ -313,15 +316,22 @@ unsafe fn sample_live_fighter(fighter: &mut SmashlineFighterCommon) {
     if hooks_quiesced() {
         return;
     }
+    let clock_zero = GAME_INFO.remaining_frames.load(Ordering::SeqCst) == 0;
     if !GAME_INFO.is_match.load(Ordering::SeqCst)
         || GAME_INFO.is_results_screen.load(Ordering::SeqCst)
     {
         match_feed::set_sampling(false);
+        // Time-up can flip to the results screen on the same frame the clock
+        // hits 0. Arm before sudden death, without reading fighter info.
+        if clock_zero {
+            arm_clock_zero();
+        }
         return;
     }
-    // Time-up and sudden death. Stop before touching fighter modules.
-    if GAME_INFO.remaining_frames.load(Ordering::SeqCst) == 0 {
+    // Time-up. Stop before touching fighter modules. Sudden death is not recorded.
+    if clock_zero {
         match_feed::set_sampling(false);
+        arm_clock_zero();
         return;
     }
     latch_versus_on_entry();
@@ -420,7 +430,10 @@ unsafe fn read_results_if_ready() -> bool {
     let remaining = get_remaining_time_as_frame();
     GAME_INFO.remaining_frames.store(remaining, Ordering::SeqCst);
     if remaining == 0 {
+        // Sudden death still reports 0. Do not read stocks. If the clock-zero
+        // frame did not arm the latched snapshot, arm it now.
         quiesce_fighter_hooks();
+        arm_clock_zero();
         return true;
     }
     let count = (FighterManager::entry_count(mgr) as usize).min(GAME_INFO.players.len());
@@ -478,7 +491,23 @@ fn latch_versus_on_entry() {
     GAME_INFO.is_match.store(true, Ordering::SeqCst);
 }
 
-/// Results screen is up. Arm the results file and stop further module reads.
+/// Clock hit 0 on a latched versus. One snapshot, then hooks stay quiet so
+/// the next entry can reset. Does not read fighter modules.
+fn arm_clock_zero() {
+    let arm = {
+        let state = match MATCH_TICK.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        should_arm_clock_zero(state.stats_latched, state.stats_dumped, state.pending_dump)
+    };
+    if arm {
+        arm_stock_result();
+    }
+}
+
+/// Results screen is up, or the clock just hit 0. Arm the results file and
+/// stop further module reads.
 fn arm_stock_result() {
     quiesce_fighter_hooks();
     {

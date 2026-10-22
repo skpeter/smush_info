@@ -150,6 +150,13 @@ pub fn should_write_stats_snapshot(
     ticks_since_dump >= cooldown
 }
 
+/// Clock hit 0 on a latched versus. Arm one snapshot of the frozen totals.
+/// A dump already in flight or already finished must not arm again, or sudden
+/// death would overwrite the time-up result.
+pub fn should_arm_clock_zero(latched: bool, dumped: bool, pending: bool) -> bool {
+    latched && !dumped && !pending
+}
+
 /// Sorted pair of entry ids that are in-game. Exactly two required.
 pub fn active_entry_pair(in_game: [bool; 8]) -> Option<[usize; 2]> {
     let mut first = None;
@@ -886,6 +893,14 @@ mod tests {
         assert!(!should_write_stats_snapshot(true, false, 7500, 7500));
         assert!(!should_write_stats_snapshot(false, true, 10, 7500));
         assert!(should_write_stats_snapshot(false, true, 7500, 7500));
+    }
+
+    #[test]
+    fn clock_zero_arms_once_for_a_latched_match() {
+        assert!(should_arm_clock_zero(true, false, false));
+        assert!(!should_arm_clock_zero(true, true, false));
+        assert!(!should_arm_clock_zero(true, false, true));
+        assert!(!should_arm_clock_zero(false, false, false));
     }
 
     #[test]

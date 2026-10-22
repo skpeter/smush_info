@@ -17,7 +17,8 @@ pub use atomic_text::AtomicText;
 
 mod match_stats;
 pub use match_stats::{
-    active_entry_pair, map_status, should_write_stats_snapshot, slot_for_entry, tick_owner_entry,
+    active_entry_pair, map_status, should_arm_clock_zero, should_write_stats_snapshot, slot_for_entry,
+    tick_owner_entry,
     FighterSummary, FrameSample, MatchStats, OpeningRecord, Phase,
 };
 
