@@ -1,12 +1,11 @@
 #![feature(proc_macro_hygiene)]
-#![feature(simd_ffi)]
 
 use skyline::hooks::{getRegionAddress, Region, InlineCtx};
 use skyline::from_c_str;
 use skyline::libc::*;
 use std::time::Duration;
 use std::mem::size_of_val;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use smash::app;
@@ -17,12 +16,9 @@ use smash::lib::L2CValue;
 use smush_info_shared::{handshake_response, should_write_stats_snapshot, text_frame, Character, Info};
 use lazy_static::lazy_static;
 
-use smash::Vector3f;
-use smash::Vector2f;
 
 use smashline::{
-    original_status, Agent, CheckDamage, ExecStop, L2CFighterCommon as SmashlineFighterCommon,
-    Main, Pre,
+    original_status, Agent, L2CFighterCommon as SmashlineFighterCommon, Main, Pre,
 };
 
 mod conversions;
@@ -44,13 +40,6 @@ static FIGHTER_SELECTED_SEARCH_CODE: &[u8] = &[
     0xe1, 0x03, 0x1a, 0x32,
 ];
 
-#[repr(C)]
-#[derive(Debug, Copy, Clone)]
-pub struct Float32x2 {
-    pub x: f32,
-    pub y: f32,
-}
-
 extern "C" {
     #[link_name = "\u{1}_ZN3app7utility8get_kindEPKNS_26BattleObjectModuleAccessorE"]
     pub fn get_kind(module_accessor: &mut app::BattleObjectModuleAccessor) -> i32;
@@ -60,9 +49,6 @@ extern "C" {
 
     #[link_name = "\u{1}_ZN3app14sv_information27get_remaining_time_as_frameEv"]
     pub fn get_remaining_time_as_frame() -> u32;
-    
-    #[link_name = "\u{1}_ZN3app17sv_camera_manager15world_to_screenERKN3phx8Vector3fEb"]
-    pub fn world_to_screen(vec: *const Vector3f, unk: bool) -> Float32x2;
 }
 
 fn send_bytes(socket: i32, mut bytes: &[u8]) -> Result<(), i64> {
@@ -234,96 +220,164 @@ fn accept_client_socket(listener_socket: i32) -> Result<i32, i64> {
     }
 }
 
-fn as_pixels(vec: Vector3f) -> Vector2f {
-    unsafe {
-        let screen = world_to_screen(&vec, true);
-        Vector2f { x: screen.x, y: screen.y }
+// Smashline status scripts — skyline `replace = L2CFighterCommon_*` on common NRO
+// crashes on 13.0.5 when Smashline is loaded.
+/// 0 = not waiting. `u64::MAX` = a results poll is in progress.
+static RESULT_POLL_NOT_BEFORE: AtomicU64 = AtomicU64::new(0);
+const RESULT_POLL_DELAY_MS: u64 = 3_000;
+const RESULT_POLL_RETRY_MS: u64 = 500;
+
+fn mono_ms() -> u64 {
+    lazy_static! {
+        static ref MONO_START: std::time::Instant = std::time::Instant::now();
+    }
+    MONO_START.elapsed().as_millis() as u64
+}
+
+fn schedule_result_poll() {
+    if RESULT_POLL_NOT_BEFORE.load(Ordering::SeqCst) == u64::MAX {
+        return;
+    }
+    RESULT_POLL_NOT_BEFORE.store(mono_ms().saturating_add(RESULT_POLL_DELAY_MS), Ordering::SeqCst);
+}
+
+fn cancel_result_poll() {
+    if RESULT_POLL_NOT_BEFORE.load(Ordering::SeqCst) == u64::MAX {
+        return;
+    }
+    RESULT_POLL_NOT_BEFORE.store(0, Ordering::SeqCst);
+}
+
+/// Live socket flags. The TCP thread must not call `FighterManager` (that races
+/// replay teardown). Stage select used to clear `is_results_screen`; replays never
+/// take that path, so the results latch stayed on for the next game.
+unsafe fn refresh_reported_match() {
+    let mgr: *mut app::FighterManager = if FIGHTER_MANAGER_ADDR == 0 {
+        std::ptr::null_mut()
+    } else {
+        *(FIGHTER_MANAGER_ADDR as *mut *mut app::FighterManager)
+    };
+    let current_menu: u32 = *(offset_to_addr(MENU_OFFSET) as *const u32);
+    const CONTROLS_SCREEN_MENU: u32 = 0x6020000;
+    const MII_MAKER_MENU: u32 = 0x4050000;
+    let menu_is_gameplay = current_menu != CONTROLS_SCREEN_MENU && current_menu != MII_MAKER_MENU;
+    let has_entries = !mgr.is_null() && FighterManager::entry_count(mgr) > 0 && menu_is_gameplay;
+    let result_mode = has_entries && FighterManager::is_result_mode(mgr);
+    let in_match = has_entries && !result_mode;
+    GAME_INFO.current_menu.store(current_menu, Ordering::SeqCst);
+    GAME_INFO.is_match.store(in_match, Ordering::SeqCst);
+    GAME_INFO.is_results_screen.store(result_mode, Ordering::SeqCst);
+    let remaining = if in_match || result_mode {
+        get_remaining_time_as_frame()
+    } else {
+        -1.0 as u32
+    };
+    GAME_INFO.remaining_frames.store(remaining, Ordering::SeqCst);
+}
+
+/// Installed so the results read runs on the game thread. Returns before any
+/// fighter-module read while a death is pending. The KO camera frame only stores
+/// that deadline. While no death is pending, refresh the socket flags and sample.
+unsafe extern "C" fn poll_results_after_ko(fighter: &mut SmashlineFighterCommon) {
+    let due = RESULT_POLL_NOT_BEFORE.load(Ordering::SeqCst);
+    if due == 0 {
+        refresh_reported_match();
+        sample_live_fighter(fighter);
+        return;
+    }
+    if due == u64::MAX {
+        return;
+    }
+    let now = mono_ms();
+    if now < due {
+        return;
+    }
+    if RESULT_POLL_NOT_BEFORE
+        .compare_exchange(due, u64::MAX, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return;
+    }
+    let done = unsafe { read_results_if_ready() };
+    if done {
+        RESULT_POLL_NOT_BEFORE.store(0, Ordering::SeqCst);
+    } else {
+        RESULT_POLL_NOT_BEFORE.store(now.saturating_add(RESULT_POLL_RETRY_MS), Ordering::SeqCst);
     }
 }
 
-unsafe extern "C" fn once_per_frame_per_fighter(fighter: &mut SmashlineFighterCommon) {
+/// One live frame for one fighter. No-op on the results screen, at clock 0,
+/// and once a death has scheduled the KO-camera wait. Does not read
+/// `FighterInformation` or convert world position to screen pixels.
+unsafe fn sample_live_fighter(fighter: &mut SmashlineFighterCommon) {
+    if hooks_quiesced() {
+        return;
+    }
+    if !GAME_INFO.is_match.load(Ordering::SeqCst)
+        || GAME_INFO.is_results_screen.load(Ordering::SeqCst)
+    {
+        match_feed::set_sampling(false);
+        return;
+    }
+    // Time-up and sudden death. Stop before touching fighter modules.
+    if GAME_INFO.remaining_frames.load(Ordering::SeqCst) == 0 {
+        match_feed::set_sampling(false);
+        return;
+    }
+    latch_versus_on_entry();
     let module_accessor = fighter.module_accessor;
     let entry_id =
         WorkModule::get_int(module_accessor, *FIGHTER_INSTANCE_WORK_ID_INT_ENTRY_ID) as i32;
-    let player_num = entry_id as usize;
-    if player_num >= GAME_INFO.players.len() {
+    if entry_id < 0 {
         return;
     }
-    let pos_x = PostureModule::pos_x(module_accessor);
-    let pos_y = PostureModule::pos_y(module_accessor);
-    let pos_z = PostureModule::pos_z(module_accessor);
-    let pos = Vector3f {
-        x: pos_x,
-        y: pos_y,
-        z: pos_z,
-    };
-    let screen_pos = as_pixels(pos);
-    GAME_INFO.players[player_num].x.store(screen_pos.x, Ordering::SeqCst);
-    GAME_INFO.players[player_num].y.store(screen_pos.y, Ordering::SeqCst);
-    // Never serde / SD-write / prune on the smashline L2C thread — that path crashed
-    // (UndefInstr in results_log::prune_oldest). Always hand off to the 1MB dump thread.
-    // Tick before capture so a new match clears stale slots first.
-    // Tick/flush on the lower active entry id (not hard-coded port 0).
-    let owns_tick = match_feed::is_tick_owner(player_num, &GAME_INFO);
-    if owns_tick {
-        tick_match_state(true);
+    if StatusModule::status_kind(module_accessor) == *FIGHTER_STATUS_KIND_DEAD {
+        return;
     }
-    match_feed::capture(module_accessor, player_num);
-    if owns_tick {
-        request_large_stack_flush();
-    }
+    match_feed::capture(module_accessor, entry_id as usize);
 }
 
-fn install_fighter_frame_hook() {
+fn install_results_poll_hook() {
     Agent::new("fighter")
-        .on_line(Main, once_per_frame_per_fighter)
-        .on_line(ExecStop, once_per_frame_per_fighter)
+        .on_line(Main, poll_results_after_ko)
         .install();
 }
 
-// Smashline status scripts — skyline `replace = L2CFighterCommon_*` on common NRO
-// crashes on 13.0.5 when Smashline is loaded.
 unsafe extern "C" fn handle_pre_entry(fighter: &mut SmashlineFighterCommon) -> L2CValue {
+    cancel_result_poll();
+    let was_quiesced = HOOKS_QUIESCED.swap(false, Ordering::SeqCst);
+    if was_quiesced {
+        for player in &GAME_INFO.players {
+            player.is_in_game.store(false, Ordering::SeqCst);
+        }
+        release_fighter_hooks_for_new_match();
+    }
     let module_accessor = app::sv_system::battle_object_module_accessor(fighter.lua_state_agent);
     set_player_information(module_accessor);
     GAME_INFO
         .stage
         .store(stage_id_to_stage(stage_id()) as u32, Ordering::SeqCst);
+    latch_versus_on_entry();
     original_status(Pre, fighter, *FIGHTER_STATUS_KIND_ENTRY)(fighter)
 }
 
 unsafe extern "C" fn handle_pre_rebirth(fighter: &mut SmashlineFighterCommon) -> L2CValue {
-    let module_accessor = app::sv_system::battle_object_module_accessor(fighter.lua_state_agent);
-    set_player_information(module_accessor);
+    if !hooks_quiesced() {
+        // Respawn means that stock loss was not the end of the match.
+        cancel_result_poll();
+        let module_accessor = app::sv_system::battle_object_module_accessor(fighter.lua_state_agent);
+        set_player_information(module_accessor);
+    }
     original_status(Pre, fighter, *FIGHTER_STATUS_KIND_REBIRTH)(fighter)
 }
 
 unsafe extern "C" fn handle_pre_dead(fighter: &mut SmashlineFighterCommon) -> L2CValue {
-    let module_accessor = app::sv_system::battle_object_module_accessor(fighter.lua_state_agent);
-    let entry_id =
-        WorkModule::get_int(module_accessor, *FIGHTER_INSTANCE_WORK_ID_INT_ENTRY_ID) as i32;
-    let player_num = entry_id as usize;
-    if player_num < GAME_INFO.players.len() && FIGHTER_MANAGER_ADDR != 0 {
-        let mgr = *(FIGHTER_MANAGER_ADDR as *mut *mut app::FighterManager);
-        let fighter_information = FighterManager::get_fighter_information(
-            mgr,
-            app::FighterEntryID(entry_id),
-        ) as *mut app::FighterInformation;
-        let stock_count =
-            (FighterInformation::stock_count(fighter_information) as u32).saturating_sub(1);
-        GAME_INFO.players[player_num]
-            .stocks
-            .store(stock_count, Ordering::SeqCst);
+    if !hooks_quiesced() {
+        // The KO replay camera faults if stocks are read from this status.
+        // Final stocks are read once the results screen is up.
+        schedule_result_poll();
     }
     original_status(Pre, fighter, *FIGHTER_STATUS_KIND_DEAD)(fighter)
-}
-
-unsafe extern "C" fn handle_check_damage(
-    fighter: &mut SmashlineFighterCommon,
-    _damage: &L2CValue,
-) {
-    let module_accessor = app::sv_system::battle_object_module_accessor(fighter.lua_state_agent);
-    set_player_information(module_accessor);
 }
 
 fn install_fighter_status_hooks() {
@@ -331,12 +385,146 @@ fn install_fighter_status_hooks() {
         .status(Pre, *FIGHTER_STATUS_KIND_ENTRY, handle_pre_entry)
         .status(Pre, *FIGHTER_STATUS_KIND_REBIRTH, handle_pre_rebirth)
         .status(Pre, *FIGHTER_STATUS_KIND_DEAD, handle_pre_dead)
-        .on_line(CheckDamage, handle_check_damage)
         .install();
 }
 
 
 pub(crate) static GAME_INFO: Info = Info::new();
+
+/// Set when a stock match is decided or the clock hits 0. Cleared on the next entry.
+/// While set, rebirth and death do not touch fighter modules.
+static HOOKS_QUIESCED: AtomicBool = AtomicBool::new(false);
+
+fn hooks_quiesced() -> bool {
+    HOOKS_QUIESCED.load(Ordering::SeqCst)
+}
+
+fn quiesce_fighter_hooks() {
+    HOOKS_QUIESCED.store(true, Ordering::SeqCst);
+    match_feed::set_sampling(false);
+}
+
+/// Called from the delayed Main poll, only after `is_result_mode` is true.
+/// Returns true when the wait is over (results recorded, or sudden death discarded).
+unsafe fn read_results_if_ready() -> bool {
+    if FIGHTER_MANAGER_ADDR == 0 {
+        return false;
+    }
+    let mgr = *(FIGHTER_MANAGER_ADDR as *mut *mut app::FighterManager);
+    if mgr.is_null() || FighterManager::entry_count(mgr) <= 0 {
+        return false;
+    }
+    if !FighterManager::is_result_mode(mgr) {
+        return false;
+    }
+    let remaining = get_remaining_time_as_frame();
+    GAME_INFO.remaining_frames.store(remaining, Ordering::SeqCst);
+    if remaining == 0 {
+        quiesce_fighter_hooks();
+        return true;
+    }
+    let count = (FighterManager::entry_count(mgr) as usize).min(GAME_INFO.players.len());
+    for entry in 0..count {
+        let fighter_information = FighterManager::get_fighter_information(
+            mgr,
+            app::FighterEntryID(entry as i32),
+        ) as *mut app::FighterInformation;
+        if fighter_information.is_null() {
+            continue;
+        }
+        let stocks = FighterInformation::stock_count(fighter_information) as u32;
+        let sd_count = FighterInformation::suicide_count(fighter_information, 0) as u32;
+        let player = &GAME_INFO.players[entry];
+        player.stocks.store(stocks, Ordering::SeqCst);
+        player.self_destructs.store(sd_count, Ordering::SeqCst);
+        player.is_in_game.store(true, Ordering::SeqCst);
+    }
+    GAME_INFO.is_results_screen.store(true, Ordering::SeqCst);
+    // Final stocks were not readable on the killing blow. Fold them in now,
+    // before the dump thread encodes the frozen summary.
+    match_feed::sync_stocks(&GAME_INFO);
+    arm_stock_result();
+    true
+}
+
+/// Versus eligibility is latched once both fighters have entered. The per-frame
+/// sampler is not installed; this only marks the match so the death hook can write.
+fn latch_versus_on_entry() {
+    let training = unsafe { app::smashball::is_training_mode() };
+    if training {
+        return;
+    }
+    let ice = (0..8).any(|slot| {
+        let player = &GAME_INFO.players[slot];
+        player.is_in_game.load(Ordering::SeqCst)
+            && is_ice_climbers(player.character.load(Ordering::SeqCst))
+    });
+    if ice || match_feed::active_pair(&GAME_INFO).is_none() {
+        return;
+    }
+    let mut state = match MATCH_TICK.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    reopen_match_state_if_idle(&mut state);
+    if state.pending_reopen || state.stats_was_eligible {
+        return;
+    }
+    match_feed::reset(&GAME_INFO);
+    state.stats_dumped = false;
+    state.stats_latched = true;
+    state.stats_was_eligible = true;
+    match_feed::set_sampling(true);
+    GAME_INFO.is_match.store(true, Ordering::SeqCst);
+}
+
+/// Results screen is up. Arm the results file and stop further module reads.
+fn arm_stock_result() {
+    quiesce_fighter_hooks();
+    {
+        let mut state = match MATCH_TICK.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let latched = state.stats_latched && !state.stats_dumped;
+        let cooldown_ok = state.ticks_since_dump >= SNAPSHOT_COOLDOWN_TICKS;
+        if (latched || cooldown_ok) && !state.pending_dump {
+            state.pending_dump = true;
+            state.pending_openings = latched;
+        }
+        state.prev_game_over = true;
+    }
+    request_large_stack_flush();
+}
+
+fn release_fighter_hooks_for_new_match() {
+    let mut state = match MATCH_TICK.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let dump_in_flight = state.pending_dump || LARGE_STACK_FLUSH_SPAWNED.load(Ordering::SeqCst);
+    if dump_in_flight {
+        state.pending_reopen = true;
+        return;
+    }
+    state.stats_was_eligible = false;
+    state.saw_match = false;
+    state.prev_game_over = false;
+}
+
+fn reopen_match_state_if_idle(state: &mut MatchTickState) {
+    if !state.pending_reopen {
+        return;
+    }
+    let dump_in_flight = state.pending_dump || LARGE_STACK_FLUSH_SPAWNED.load(Ordering::SeqCst);
+    if dump_in_flight {
+        return;
+    }
+    state.pending_reopen = false;
+    state.stats_was_eligible = false;
+    state.saw_match = false;
+    state.prev_game_over = false;
+}
 
 pub(crate) fn game_info() -> &'static Info {
     &GAME_INFO
@@ -376,6 +564,17 @@ fn collect_players(filter_invalid: bool, out: &mut [PlayerSnap; 8]) -> usize {
     n
 }
 
+/// Last stock already taken. The clock is handled separately: time-up ends the match.
+fn stock_match_decided() -> bool {
+    let mut buf = [PlayerSnap {
+        stocks: 0,
+        damage: 0.0,
+        character: 0,
+    }; 8];
+    let n = collect_players(true, &mut buf);
+    n >= 2 && has_singles_or_doubles_winner(&buf[..n], u32::MAX)
+}
+
 fn is_ice_climbers(character: u32) -> bool {
     character == Character::Nana as u32 || character == Character::Popo as u32
 }
@@ -411,6 +610,7 @@ fn has_singles_or_doubles_winner(players: &[PlayerSnap], remaining_frames: u32) 
     {
         return true;
     }
+    // `u32::MAX` skips this branch. Sudden death also reports 0 frames left.
     if remaining_frames == 0 && !players.is_empty() {
         let first = &players[0];
         if players
@@ -437,6 +637,11 @@ fn is_game_over(is_results: bool, is_match: bool) -> bool {
     let players = &buf[..n];
     if players.len() > 1 && is_match && players.iter().any(|p| is_ice_climbers(p.character)) {
         return false;
+    }
+    // Clock at 0 ends the match even when stocks and percent are tied.
+    // Sudden death is not part of the recorded result.
+    if is_match && remaining == 0 && !players.is_empty() {
+        return true;
     }
     is_results || has_singles_or_doubles_winner(players, remaining)
 }
@@ -488,6 +693,8 @@ struct MatchTickState {
     stats_dumped: bool,
     pending_dump: bool,
     pending_openings: bool,
+    /// Previous match ended while a dump was still encoding. The next tick resets.
+    pending_reopen: bool,
 }
 
 impl MatchTickState {
@@ -501,6 +708,7 @@ impl MatchTickState {
             stats_dumped: false,
             pending_dump: false,
             pending_openings: false,
+            pending_reopen: false,
         }
     }
 }
@@ -572,23 +780,35 @@ fn flush_match_snapshot() {
 
 #[inline(never)]
 fn tick_match_state(on_game_thread: bool) {
-    let need_fallback_flush = {
-        let mut state = match MATCH_TICK.lock() {
-            Ok(s) => s,
-            Err(poisoned) => poisoned.into_inner(),
+    if !on_game_thread {
+        // The socket and UDP threads used to call FighterManager here. That races
+        // the game thread tearing the match down at the end of a replay, and the
+        // frame update then null-dereferences. Only flush a dump the game thread
+        // already armed.
+        let pending = {
+            let state = match MATCH_TICK.lock() {
+                Ok(s) => s,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            state.pending_dump
         };
-        unsafe {
-            update_match_state(&mut state, on_game_thread);
+        if pending {
+            request_large_stack_flush();
         }
-        state.pending_dump && !on_game_thread
+        return;
+    }
+    let mut state = match MATCH_TICK.lock() {
+        Ok(s) => s,
+        Err(poisoned) => poisoned.into_inner(),
     };
-    if need_fallback_flush {
-        request_large_stack_flush();
+    unsafe {
+        update_match_state(&mut state, true);
     }
 }
 
 #[inline(never)]
 unsafe fn update_match_state(state: &mut MatchTickState, on_game_thread: bool) {
+    reopen_match_state_if_idle(state);
     // FighterManager singleton may not exist yet (early in app boot, before title screen)
     // and FIGHTER_MANAGER_ADDR can be 0 if LookupSymbol failed. Treat both as "no match"
     // to avoid dereferencing a null this-pointer in entry_count/is_result_mode.
@@ -617,6 +837,10 @@ unsafe fn update_match_state(state: &mut MatchTickState, on_game_thread: bool) {
     }
 
     let game_over = state.saw_match && is_game_over(is_results, is_match);
+    // Clock at 0 or last stock ends stat sampling. Sudden death is discarded.
+    // Screen position is not part of this and keeps updating on Main.
+    let time_up = is_match && GAME_INFO.remaining_frames.load(Ordering::SeqCst) == 0;
+    let match_finished = is_results || time_up || stock_match_decided();
     // gstack-shortcut(dec-6ea7e982-17b2-4d92-824f-8fa6f2edd87d): 6/10, upgrade when Spirits, Classic, and World of Light menu ids are known
     let entry_count = if mgr.is_null() {
         0
@@ -630,7 +854,7 @@ unsafe fn update_match_state(state: &mut MatchTickState, on_game_thread: bool) {
     });
     let eligible = is_match && entry_count == 2 && !training && !ice_climbers;
     if on_game_thread {
-        if is_results {
+        if match_finished {
             match_feed::set_sampling(false);
         } else if eligible {
             if !state.stats_was_eligible {
@@ -696,6 +920,9 @@ unsafe fn update_match_state(state: &mut MatchTickState, on_game_thread: bool) {
 
     state.prev_game_over = game_over;
     state.ticks_since_dump = state.ticks_since_dump.saturating_add(1);
+    if match_finished {
+        HOOKS_QUIESCED.store(true, Ordering::SeqCst);
+    }
 }
 
 #[allow(unreachable_code)]
@@ -956,14 +1183,47 @@ fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 
 pub static mut FIGHTER_MANAGER_ADDR: usize = 0;
 
+pub unsafe fn note_fighter_from_modules(module_accessor: &mut app::BattleObjectModuleAccessor) {
+    let entry_id = WorkModule::get_int(module_accessor, *FIGHTER_INSTANCE_WORK_ID_INT_ENTRY_ID) as i32;
+    if entry_id < 0 {
+        return;
+    }
+    let player_num = entry_id as usize;
+    if player_num >= GAME_INFO.players.len() {
+        return;
+    }
+    let character = kind_to_char(get_kind(module_accessor)) as u32;
+    let damage = DamageModule::damage(module_accessor, 0);
+    let skin = WorkModule::get_int(module_accessor, *FIGHTER_INSTANCE_WORK_ID_INT_COLOR) as u32;
+    let team = TeamModule::team_no(module_accessor) as i32;
+    let player = &GAME_INFO.players[player_num];
+    player.is_in_game.store(true, Ordering::SeqCst);
+    player.character.store(character, Ordering::SeqCst);
+    player.damage.store(damage, Ordering::SeqCst);
+    player.skin.store(skin, Ordering::SeqCst);
+    player.team.store(team, Ordering::SeqCst);
+}
+
 pub unsafe fn set_player_information(module_accessor: &mut app::BattleObjectModuleAccessor) {
     let entry_id = WorkModule::get_int(module_accessor, *FIGHTER_INSTANCE_WORK_ID_INT_ENTRY_ID) as i32;
+    if entry_id < 0 {
+        return;
+    }
     let player_num = entry_id as usize;
+    if player_num >= GAME_INFO.players.len() || FIGHTER_MANAGER_ADDR == 0 {
+        return;
+    }
     let mgr = *(FIGHTER_MANAGER_ADDR as *mut *mut app::FighterManager);
+    if mgr.is_null() {
+        return;
+    }
     let fighter_information = FighterManager::get_fighter_information(
         mgr, 
         app::FighterEntryID(entry_id)
     ) as *mut app::FighterInformation;
+    if fighter_information.is_null() {
+        return;
+    }
 
     let character = kind_to_char(get_kind(module_accessor)) as u32;
     let damage = DamageModule::damage(module_accessor, 0);
@@ -1250,7 +1510,7 @@ fn udp_broadcast_loop() {
     loop {
         std::thread::sleep(std::time::Duration::from_secs(1));
         udp::broadcast_device_info();
-        // 1Hz results fallback when no overlay and no fighter frames (e.g. IC → results).
+        // Flush a dump the game thread already armed. Do not read FighterManager here.
         let tick: fn(bool) = tick_match_state;
         std::hint::black_box(tick)(false);
     }
@@ -1297,7 +1557,9 @@ pub fn main() {
         special_lw_decide_command_hook,
         special_lw_select_index_hook
     );
-    install_fighter_frame_hook();
+    // Main samples a live 1v1 and polls for the results screen a few seconds
+    // after a death. It does not read fighter modules on the KO camera frame.
+    install_results_poll_hook();
     install_fighter_status_hooks();
 
     std::thread::spawn(server_supervisor);

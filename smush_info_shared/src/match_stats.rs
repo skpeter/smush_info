@@ -14,6 +14,7 @@
 //! hitstun == 0 and OnGround       --> decrement counter, then neutral
 //! Rebirth                         --> neutral immediately
 //! Dead during a string            --> that string killed
+//! Stock drop after damage reset   --> death percent is the previous sample
 //! ```
 //!
 //! Move names on a stream overlay should credit Vye (Vye#0547) and
@@ -280,6 +281,45 @@ impl MatchStats {
         self.update_strings(samples);
     }
 
+    /// Results screen stocks, read after the KO camera. Uses the last live
+    /// sample's percent when this drop was not seen during play.
+    pub fn note_stocks(&mut self, slot: usize, stocks: u32, suicide_count: u32) {
+        if slot >= 2 {
+            return;
+        }
+        if !self.baseline_ready[slot] {
+            self.initial_stocks[slot] = stocks;
+            self.initial_sds[slot] = suicide_count;
+            self.baseline_ready[slot] = true;
+        }
+        if self.stocks_seen[slot] && stocks < self.old_stocks[slot] {
+            let percent = if self.damage_seen[slot] {
+                self.old_damage_dealt[slot]
+            } else {
+                self.slots[slot].damage
+            };
+            self.death_percents[slot].push(percent);
+            self.mark_kill(slot);
+        }
+        self.old_stocks[slot] = stocks;
+        self.stocks_seen[slot] = true;
+        self.last_stocks[slot] = stocks;
+        self.last_sds[slot] = suicide_count;
+        self.slots[slot].stocks = stocks;
+        self.slots[slot].suicide_count = suicide_count;
+    }
+
+    fn mark_kill(&mut self, them: usize) {
+        if self.being_comboed_by[them] < 0 {
+            return;
+        }
+        let me = self.being_comboed_by[them] as usize;
+        if let Some(string) = self.strings[me].last_mut() {
+            string.killed = true;
+        }
+        self.being_comboed_by[them] = -1;
+    }
+
     pub fn summary(&self) -> [FighterSummary; 2] {
         [self.fighter_summary(0), self.fighter_summary(1)]
     }
@@ -386,7 +426,16 @@ impl MatchStats {
                 self.old_stocks[i] = samples[i].stocks;
                 self.stocks_seen[i] = true;
             } else if samples[i].stocks < self.old_stocks[i] {
-                self.death_percents[i].push(samples[i].damage);
+                // Respawn samples a reset percent. The death percent is the
+                // previous sample, which is still the percent at the KO.
+                let previous = self.string_old_damage[i];
+                let percent = if samples[i].damage < previous {
+                    previous
+                } else {
+                    samples[i].damage
+                };
+                self.death_percents[i].push(percent);
+                self.mark_kill(i);
                 self.old_stocks[i] = samples[i].stocks;
             } else if samples[i].stocks > self.old_stocks[i] {
                 self.old_stocks[i] = samples[i].stocks;
@@ -740,6 +789,42 @@ mod tests {
         assert_eq!(summary[0].latest_death, 80.0);
         assert_eq!(summary[0].avg_death, 80.0);
         assert_eq!(summary[1].earliest_death, 40.0);
+    }
+
+    #[test]
+    fn respawn_keeps_the_death_percent_from_before_the_reset() {
+        let mut stats = MatchStats::new();
+        let mut live = FrameSample::neutral(0.0);
+        live.stocks = 3;
+        step(&mut stats, live, live);
+        let mut attacker = FrameSample::neutral(0.0);
+        attacker.stocks = 3;
+        attacker.motion = 9;
+        let mut defender = FrameSample::neutral(87.5);
+        defender.stocks = 3;
+        defender.hitstun = 6.0;
+        defender.phase = Phase::Hitstun;
+        step(&mut stats, attacker, defender);
+        let mut respawn = FrameSample::neutral(0.0);
+        respawn.stocks = 2;
+        respawn.phase = Phase::Rebirth;
+        step(&mut stats, attacker, respawn);
+        let summary = stats.summary();
+        assert_eq!(summary[1].earliest_death, 87.5);
+        assert_eq!(summary[0].stocks_taken, 1);
+        assert!(stats.openings()[0][0].killed);
+        assert_eq!(summary[0].non_killing_wins, 0);
+    }
+
+    #[test]
+    fn note_stocks_uses_the_last_live_percent() {
+        let mut stats = MatchStats::new();
+        let mut live = FrameSample::neutral(64.0);
+        live.stocks = 2;
+        step(&mut stats, live, FrameSample::neutral(0.0));
+        stats.note_stocks(0, 1, 0);
+        assert_eq!(stats.summary()[0].earliest_death, 64.0);
+        assert_eq!(stats.summary()[1].stocks_taken, 1);
     }
 
     #[test]

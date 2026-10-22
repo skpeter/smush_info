@@ -6,8 +6,6 @@ use smush_info_shared::{
 };
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use crate::FIGHTER_MANAGER_ADDR;
-
 static STATS_SAMPLING: AtomicBool = AtomicBool::new(false);
 /// Temporary tick owner before both fighters are marked in-game.
 static FALLBACK_TICK_OWNER: AtomicUsize = AtomicUsize::new(usize::MAX);
@@ -70,24 +68,23 @@ pub unsafe fn capture(
     module_accessor: *mut app::BattleObjectModuleAccessor,
     entry: usize,
 ) -> bool {
-    if !STATS_SAMPLING.load(Ordering::SeqCst) || FIGHTER_MANAGER_ADDR == 0 {
+    if !STATS_SAMPLING.load(Ordering::SeqCst) {
         return false;
     }
     let info = crate::game_info();
     let Some(slot) = slot_for_entry(entry, in_game_flags(info)) else {
         return false;
     };
-    let mgr = *(FIGHTER_MANAGER_ADDR as *mut *mut app::FighterManager);
-    if mgr.is_null() {
+    if entry >= info.players.len() {
         return false;
     }
-    let fighter_information = FighterManager::get_fighter_information(
-        mgr,
-        app::FighterEntryID(entry as i32),
-    ) as *mut app::FighterInformation;
-    if fighter_information.is_null() {
-        return false;
-    }
+    let player = &info.players[entry];
+    // Stored stocks only. FighterInformation on the killing-blow frame crashes
+    // the KO camera. Entry, respawn, and the results poll publish stocks.
+    let stocks = player.stocks.load(Ordering::SeqCst);
+    let suicide_count = player.self_destructs.load(Ordering::SeqCst);
+    let damage = DamageModule::damage(module_accessor, 0);
+    player.damage.store(damage, Ordering::SeqCst);
     let hitstun = WorkModule::get_float(
         module_accessor,
         *FIGHTER_INSTANCE_WORK_ID_FLOAT_DAMAGE_REACTION_FRAME,
@@ -97,13 +94,13 @@ pub unsafe fn capture(
         phase = Phase::Hitstun;
     }
     let sample = FrameSample {
-        damage: DamageModule::damage(module_accessor, 0),
+        damage,
         hitstun,
         phase,
         motion: MotionModule::motion_kind(module_accessor),
         world_x: PostureModule::pos_x(module_accessor),
-        stocks: FighterInformation::stock_count(fighter_information) as u32,
-        suicide_count: FighterInformation::suicide_count(fighter_information, 0) as u32,
+        stocks,
+        suicide_count,
         character: info.players[entry].character.load(Ordering::SeqCst),
     };
     // The sample keeps its own stocks. Do not write players[].stocks here.
@@ -112,6 +109,26 @@ pub unsafe fn capture(
         publish(info);
     }
     stepped
+}
+
+/// Copy results-screen stocks into the calculator and publish. The KO camera
+/// frame never reads `FighterInformation`; this runs only after result mode.
+pub fn sync_stocks(info: &Info) {
+    let Some(pair) = active_pair(info) else {
+        return;
+    };
+    unsafe {
+        for slot in 0..2 {
+            let entry = pair[slot];
+            let player = &info.players[entry];
+            STATS.note_stocks(
+                slot,
+                player.stocks.load(Ordering::SeqCst),
+                player.self_destructs.load(Ordering::SeqCst),
+            );
+        }
+    }
+    publish(info);
 }
 
 pub fn publish(info: &Info) {
