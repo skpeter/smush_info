@@ -1,0 +1,8 @@
+# Uncomment a flag to disable that feature.
+# Missing file = all features on.
+[smush_info]
+disable_list = [
+    # "disable_results_log",
+    # "disable_replay_save",
+    # "disable_results_skip",
+]

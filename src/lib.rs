@@ -1,4 +1,5 @@
 #![feature(proc_macro_hygiene)]
+#![feature(simd_ffi)]
 
 use skyline::hooks::{getRegionAddress, Region, InlineCtx};
 use skyline::from_c_str;
@@ -12,6 +13,8 @@ use smash::app;
 use smash::app::lua_bind::*;
 use smash::lib::lua_const::*;
 use smash::lib::L2CValue;
+use smash::Vector2f;
+use smash::Vector3f;
 
 use smush_info_shared::{
     handshake_response, should_arm_clock_zero, should_write_stats_snapshot, text_frame, Character,
@@ -27,7 +30,9 @@ use smashline::{
 mod conversions;
 use conversions::{kind_to_char, stage_id_to_stage};
 mod match_feed;
+mod overrides;
 mod results_log;
+mod replay_dump;
 mod udp;
 
 static mut OFFSET1 : usize = 0x1b52a0;
@@ -52,6 +57,23 @@ extern "C" {
 
     #[link_name = "\u{1}_ZN3app14sv_information27get_remaining_time_as_frameEv"]
     pub fn get_remaining_time_as_frame() -> u32;
+
+    #[link_name = "\u{1}_ZN3app17sv_camera_manager15world_to_screenERKN3phx8Vector3fEb"]
+    pub fn world_to_screen(vec: *const Vector3f, unk: bool) -> Float32x2;
+}
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct Float32x2 {
+    pub x: f32,
+    pub y: f32,
+}
+
+fn as_pixels(vec: Vector3f) -> Vector2f {
+    unsafe {
+        let screen = world_to_screen(&vec, true);
+        Vector2f { x: screen.x, y: screen.y }
+    }
 }
 
 fn send_bytes(socket: i32, mut bytes: &[u8]) -> Result<(), i64> {
@@ -282,6 +304,9 @@ unsafe fn refresh_reported_match() {
 /// fighter-module read while a death is pending. The KO camera frame only stores
 /// that deadline. While no death is pending, refresh the socket flags and sample.
 unsafe extern "C" fn poll_results_after_ko(fighter: &mut SmashlineFighterCommon) {
+    // Replay save and the results file arm from this tick. Once per frame, including
+    // the KO-camera wait. This does not read fighter modules or the camera.
+    tick_match_once_per_frame();
     let due = RESULT_POLL_NOT_BEFORE.load(Ordering::SeqCst);
     if due == 0 {
         refresh_reported_match();
@@ -311,7 +336,7 @@ unsafe extern "C" fn poll_results_after_ko(fighter: &mut SmashlineFighterCommon)
 
 /// One live frame for one fighter. No-op on the results screen, at clock 0,
 /// and once a death has scheduled the KO-camera wait. Does not read
-/// `FighterInformation` or convert world position to screen pixels.
+/// `FighterInformation`. Screen position is updated only on a live frame.
 unsafe fn sample_live_fighter(fighter: &mut SmashlineFighterCommon) {
     if hooks_quiesced() {
         return;
@@ -344,6 +369,7 @@ unsafe fn sample_live_fighter(fighter: &mut SmashlineFighterCommon) {
     if StatusModule::status_kind(module_accessor) == *FIGHTER_STATUS_KIND_DEAD {
         return;
     }
+    store_screen_position(module_accessor, entry_id as usize);
     match_feed::capture(module_accessor, entry_id as usize);
 }
 
@@ -351,6 +377,23 @@ fn install_results_poll_hook() {
     Agent::new("fighter")
         .on_line(Main, poll_results_after_ko)
         .install();
+}
+
+unsafe fn store_screen_position(
+    module_accessor: *mut app::BattleObjectModuleAccessor,
+    entry: usize,
+) {
+    if entry >= GAME_INFO.players.len() {
+        return;
+    }
+    let pos = Vector3f {
+        x: PostureModule::pos_x(module_accessor),
+        y: PostureModule::pos_y(module_accessor),
+        z: PostureModule::pos_z(module_accessor),
+    };
+    let screen = as_pixels(pos);
+    GAME_INFO.players[entry].x.store(screen.x, Ordering::SeqCst);
+    GAME_INFO.players[entry].y.store(screen.y, Ordering::SeqCst);
 }
 
 unsafe extern "C" fn handle_pre_entry(fighter: &mut SmashlineFighterCommon) -> L2CValue {
@@ -539,6 +582,8 @@ fn release_fighter_hooks_for_new_match() {
     state.stats_was_eligible = false;
     state.saw_match = false;
     state.prev_game_over = false;
+    state.prev_is_match = false;
+    state.dumped_this_match = false;
 }
 
 fn reopen_match_state_if_idle(state: &mut MatchTickState) {
@@ -553,6 +598,8 @@ fn reopen_match_state_if_idle(state: &mut MatchTickState) {
     state.stats_was_eligible = false;
     state.saw_match = false;
     state.prev_game_over = false;
+    state.prev_is_match = false;
+    state.dumped_this_match = false;
 }
 
 pub(crate) fn game_info() -> &'static Info {
@@ -561,6 +608,7 @@ pub(crate) fn game_info() -> &'static Info {
 
 const MATCH_TICK_MS: u64 = 16;
 const SNAPSHOT_COOLDOWN_TICKS: u64 = 120_000 / MATCH_TICK_MS;
+const DUMP_RETRY_TICKS: u64 = 45;
 
 #[derive(Clone, Copy)]
 struct PlayerSnap {
@@ -676,24 +724,38 @@ fn is_game_over(is_results: bool, is_match: bool) -> bool {
 }
 
 #[inline(never)]
+fn game_version() -> String {
+    let mut ver = nnsdk::oe::DisplayVersion { name: [0; 16] };
+    unsafe {
+        nnsdk::oe::GetDisplayVersion(&mut ver);
+    }
+    let n = ver.name.iter().position(|&b| b == 0).unwrap_or(ver.name.len());
+    String::from_utf8_lossy(&ver.name[..n]).into_owned()
+}
+
+#[inline(never)]
 fn encode_game_info_snapshot(include_openings: bool) -> Option<Vec<u8>> {
-    let encoded = if include_openings {
-        match serde_json::to_value(&GAME_INFO) {
-            Ok(mut value) => {
-                if let Some(object) = value.as_object_mut() {
+    match serde_json::to_value(&GAME_INFO) {
+        Ok(mut value) => {
+            if let Some(object) = value.as_object_mut() {
+                object.insert(
+                    "game_version".to_string(),
+                    serde_json::Value::String(game_version()),
+                );
+                if include_openings {
                     object.insert("openings".to_string(), match_feed::openings_json());
                 }
-                serde_json::to_vec(&value)
             }
-            Err(e) => Err(e),
-        }
-    } else {
-        serde_json::to_vec(&GAME_INFO)
-    };
-    match encoded {
-        Ok(mut data) => {
-            data.push(b'\n');
-            Some(data)
+            match serde_json::to_vec(&value) {
+                Ok(mut data) => {
+                    data.push(b'\n');
+                    Some(data)
+                }
+                Err(e) => {
+                    println!("[smush_info] results snapshot serialize failed: {}", e);
+                    None
+                }
+            }
         }
         Err(e) => {
             println!("[smush_info] results snapshot serialize failed: {}", e);
@@ -704,18 +766,43 @@ fn encode_game_info_snapshot(include_openings: bool) -> Option<Vec<u8>> {
 
 #[inline(never)]
 fn dump_game_info_snapshot(include_openings: bool) -> bool {
+    let log = overrides::results_log();
+    let replay = overrides::replay_save();
+    if !log && !replay {
+        return true;
+    }
+    // Match-end MainThread Data Aborts correlated with CreateFile during results
+    // transition. This runs on the 1MB dump thread, then waits for the game's FS work.
+    std::thread::sleep(Duration::from_secs(2));
+    if !log {
+        return match results_log::timestamp_stem() {
+            Some(stem) => {
+                replay_dump::on_json_written(stem);
+                true
+            }
+            None => false,
+        };
+    }
     let Some(data) = encode_game_info_snapshot(include_openings) else {
         return false;
     };
-    // Match-end MainThread Data Aborts correlated with CreateFile during results
-    // transition; let the game finish FS work before we touch sd:/smush_info.
-    std::thread::sleep(Duration::from_secs(2));
-    results_log::write_snapshot(&data)
+    match results_log::write_snapshot(&data) {
+        Some(stem) => {
+            if replay {
+                replay_dump::on_json_written(stem);
+            }
+            true
+        }
+        None => false,
+    }
 }
+
 
 struct MatchTickState {
     prev_game_over: bool,
+    prev_is_match: bool,
     saw_match: bool,
+    dumped_this_match: bool,
     ticks_since_dump: u64,
     stats_was_eligible: bool,
     stats_latched: bool,
@@ -730,7 +817,9 @@ impl MatchTickState {
     const fn new() -> Self {
         Self {
             prev_game_over: false,
+            prev_is_match: false,
             saw_match: false,
+            dumped_this_match: false,
             ticks_since_dump: SNAPSHOT_COOLDOWN_TICKS,
             stats_was_eligible: false,
             stats_latched: false,
@@ -801,10 +890,28 @@ fn flush_match_snapshot() {
     if ok {
         state.ticks_since_dump = 0;
         state.pending_dump = false;
+        state.dumped_this_match = true;
         if include_openings {
             state.stats_dumped = true;
         }
     }
+}
+
+static LAST_MATCH_TICK_MS: AtomicU64 = AtomicU64::new(u64::MAX);
+
+fn tick_match_once_per_frame() {
+    let now = mono_ms();
+    let prev = LAST_MATCH_TICK_MS.load(Ordering::SeqCst);
+    if prev == now {
+        return;
+    }
+    if LAST_MATCH_TICK_MS
+        .compare_exchange(prev, now, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return;
+    }
+    tick_match_state(true);
 }
 
 #[inline(never)]
@@ -826,13 +933,16 @@ fn tick_match_state(on_game_thread: bool) {
         }
         return;
     }
-    let mut state = match MATCH_TICK.lock() {
-        Ok(s) => s,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    unsafe {
-        update_match_state(&mut state, true);
+    {
+        let mut state = match MATCH_TICK.lock() {
+            Ok(s) => s,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        unsafe {
+            update_match_state(&mut state, true);
+        }
     }
+    request_large_stack_flush();
 }
 
 #[inline(never)]
@@ -859,6 +969,16 @@ unsafe fn update_match_state(state: &mut MatchTickState, on_game_thread: bool) {
         && !FighterManager::is_result_mode(mgr)
         && menu_is_gameplay;
 
+    // The save Yes dialog clears is_result_mode while fighters stay entered,
+    // so is_match rises in the middle of results. saw_match stays set until
+    // both flags are false, which is when we have actually left. Resetting
+    // on that dip drops the in-flight save macro and the pending replay pair,
+    // and the next results tick starts a fresh 7.5s mute.
+    if is_match && !state.prev_is_match && !state.saw_match {
+        replay_dump::on_match_rising();
+        state.dumped_this_match = false;
+        state.ticks_since_dump = DUMP_RETRY_TICKS;
+    }
     if is_match {
         GAME_INFO.remaining_frames.store(get_remaining_time_as_frame(), Ordering::SeqCst);
         GAME_INFO.is_match.store(true, Ordering::SeqCst);
@@ -895,11 +1015,11 @@ unsafe fn update_match_state(state: &mut MatchTickState, on_game_thread: bool) {
             match_feed::set_sampling(true);
         } else {
             match_feed::set_sampling(false);
-            // Do not wipe openings / clear pending while a dump is armed or running —
-            // the 1MB thread may still be encoding STATS.
+            // The match→results gap is neither flag. A latched game still owes a file.
             let dump_in_flight =
                 state.pending_dump || LARGE_STACK_FLUSH_SPAWNED.load(Ordering::SeqCst);
-            if !dump_in_flight {
+            let keep_latched = state.stats_latched && !state.stats_dumped;
+            if !dump_in_flight && !keep_latched {
                 state.stats_was_eligible = false;
                 state.stats_latched = false;
                 state.stats_dumped = false;
@@ -913,20 +1033,26 @@ unsafe fn update_match_state(state: &mut MatchTickState, on_game_thread: bool) {
     let game_over_edge = game_over && !state.prev_game_over;
     let latched_write = state.stats_latched && !state.stats_dumped;
     let write_edge = game_over_edge || (latched_write && game_over);
-    if should_write_stats_snapshot(
+    let stats_write = should_write_stats_snapshot(
         latched_write,
         write_edge,
         state.ticks_since_dump,
         SNAPSHOT_COOLDOWN_TICKS,
-    ) {
+    );
+    // Replay save uses the results screen even when the stats winner check is quiet.
+    // Arm only. The 1MB thread writes the file and pairs the replay.
+    let replay_write = !state.dumped_this_match
+        && (is_results || game_over_edge)
+        && state.ticks_since_dump >= DUMP_RETRY_TICKS;
+    if stats_write || replay_write {
         if is_results {
             GAME_INFO.is_results_screen.store(true, Ordering::SeqCst);
         }
-        // Arm only. Flush always runs on the 1MB dump thread (never L2C / TCP / UDP).
-        state.pending_dump = true;
-        state.pending_openings = state.stats_latched;
-        // Freeze calculator before the dump thread encodes.
-        match_feed::set_sampling(false);
+        if !state.pending_dump {
+            state.pending_dump = true;
+            state.pending_openings = state.stats_latched;
+            match_feed::set_sampling(false);
+        }
     }
 
     if !is_match {
@@ -939,6 +1065,7 @@ unsafe fn update_match_state(state: &mut MatchTickState, on_game_thread: bool) {
     }
 
     GAME_INFO.current_menu.store(current_menu, Ordering::SeqCst);
+    replay_dump::set_results(is_results);
     if !mgr.is_null() && FighterManager::entry_count(mgr) > 0 && menu_is_gameplay {
         GAME_INFO.is_results_screen.store(FighterManager::is_result_mode(mgr), Ordering::SeqCst);
     }
@@ -948,6 +1075,7 @@ unsafe fn update_match_state(state: &mut MatchTickState, on_game_thread: bool) {
     }
 
     state.prev_game_over = game_over;
+    state.prev_is_match = is_match;
     state.ticks_since_dump = state.ticks_since_dump.saturating_add(1);
     if match_finished {
         HOOKS_QUIESCED.store(true, Ordering::SeqCst);
@@ -1206,7 +1334,7 @@ static OFFSET3_SEARCH_CODE: &[u8] = &[ //exact
                             //.text:00000071000D7188                 B.EQ            loc_71000D71B4
 ];
 
-fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+pub(crate) fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|window| window == needle)
 }
 
@@ -1547,6 +1675,7 @@ fn udp_broadcast_loop() {
 
 #[skyline::main(name = "smush_info")]
 pub fn main() {
+    overrides::load();
     // The sheet is parsed on the first real lookup. Do that here, on the load
     // thread, so the first hit of a session does not stall the game thread.
     smush_info_shared::preload_move_names();
@@ -1586,8 +1715,11 @@ pub fn main() {
         special_lw_decide_command_hook,
         special_lw_select_index_hook
     );
+    replay_dump::install();
     // Main samples a live 1v1 and polls for the results screen a few seconds
     // after a death. It does not read fighter modules on the KO camera frame.
+    // The same hook arms the replay save. Screen position is updated only on
+    // live frames, not on the death status.
     install_results_poll_hook();
     install_fighter_status_hooks();
 

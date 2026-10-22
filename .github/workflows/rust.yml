@@ -2,8 +2,21 @@ name: Rust
 
 on:
   workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag, or SHA to build. Leave blank to build the branch selected above.
+        required: false
+        type: string
+  workflow_call:
+    inputs:
+      ref:
+        description: Branch, tag, or SHA to build. Leave blank to build the caller ref.
+        required: false
+        type: string
   push:
   pull_request:
+  release:
+    types: [published]
 
 env:
   CARGO_TERM_COLOR: always
@@ -15,6 +28,8 @@ jobs:
     permissions: write-all
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
       - uses: dtolnay/rust-toolchain@nightly
         with:
           target: x86_64-unknown-linux-gnu
@@ -40,12 +55,25 @@ jobs:
           name: libsmush_info-nro
           path: target/aarch64-skyline-switch/release/libsmush_info.nro
           if-no-files-found: error
-      - name: Upload binaries to release
-        # Pull request refs are refs/pull/N/merge, and GitHub will not create a release for that tag.
-        if: github.event_name != 'pull_request'
+      - name: Package SD zip
+        run: bash scripts/package-sd.sh
+      - name: Name SD zip artifact
+        id: artifact
+        env:
+          BUILD_REF: ${{ inputs.ref || github.head_ref || github.ref_name }}
+        run: |
+          safe=$(printf '%s' "$BUILD_REF" | sed 's#[/:"<>|*?\\]#-#g')
+          echo "name=smush_info-sd-${safe}" >> "$GITHUB_OUTPUT"
+      - name: Upload SD zip artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.artifact.outputs.name }}
+          path: smush_info-sd.zip
+      - name: Upload SD zip to GitHub Release
+        if: github.event_name == 'release'
         uses: svenstaro/upload-release-action@v2
         with:
           repo_token: ${{ secrets.GITHUB_TOKEN }}
-          file: target/aarch64-skyline-switch/release/libsmush_info.nro
-          tag: ${{ github.ref }}
+          file: smush_info-sd.zip
+          tag: ${{ github.event.release.tag_name }}
           overwrite: true
