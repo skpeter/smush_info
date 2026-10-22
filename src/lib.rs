@@ -430,7 +430,12 @@ unsafe fn update_match_state(state: &mut MatchTickState) {
         && !FighterManager::is_result_mode(mgr)
         && menu_is_gameplay;
 
-    if is_match && !state.prev_is_match {
+    // The save Yes dialog clears is_result_mode while fighters stay entered,
+    // so is_match rises in the middle of results. saw_match stays set until
+    // both flags are false, which is when we have actually left. Resetting
+    // on that dip drops the in-flight save macro and the pending replay pair,
+    // and the next results tick starts a fresh 7.5s mute.
+    if is_match && !state.prev_is_match && !state.saw_match {
         replay_dump::on_match_rising();
         state.dumped_this_match = false;
         state.ticks_since_dump = DUMP_RETRY_TICKS;
