@@ -12,6 +12,8 @@ pub use atomic_arena_id::AtomicArenaId;
 mod atomic_name;
 pub use atomic_name::AtomicName;
 
+pub mod hid_route;
+
 #[derive(Serialize, Deserialize, Debug)]
 pub struct Info {
     pub arena_id: AtomicArenaId,
@@ -19,6 +21,10 @@ pub struct Info {
     pub current_menu: AtomicU32,
     pub is_match: AtomicBool,
     pub is_results_screen: AtomicBool,
+    pub hid_hooks: AtomicU32,
+    pub hid_npad_hits: AtomicU32,
+    pub hid_masking: AtomicBool,
+    pub hid_elapsed_ms: AtomicU32,
     pub stage: AtomicU32,
     pub players: [Player; 8]
 }
@@ -1015,6 +1021,10 @@ impl Info {
             current_menu: AtomicU32::new(u32::MAX),
             is_match: AtomicBool::new(false),
             is_results_screen: AtomicBool::new(false),
+            hid_hooks: AtomicU32::new(0),
+            hid_npad_hits: AtomicU32::new(0),
+            hid_masking: AtomicBool::new(false),
+            hid_elapsed_ms: AtomicU32::new(0),
             stage: AtomicU32::new(Stage::None as u32),
             players: [
                 Player::new(),
@@ -1169,6 +1179,10 @@ mod shared_tests {
             remaining_frames: AtomicU32::new(3),
             current_menu: AtomicU32::new(3),
             is_results_screen: AtomicBool::new(false),
+            hid_hooks: AtomicU32::new(0),
+            hid_npad_hits: AtomicU32::new(0),
+            hid_masking: AtomicBool::new(false),
+            hid_elapsed_ms: AtomicU32::new(0),
             stage: AtomicU32::new(Stage::Plankton as u32),
             players: [
                 Player::new(),

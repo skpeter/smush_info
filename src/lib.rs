@@ -24,7 +24,9 @@ use smashline::{
 
 mod conversions;
 use conversions::{kind_to_char, stage_id_to_stage};
+mod overrides;
 mod results_log;
+mod replay_dump;
 mod udp;
 
 static mut OFFSET1 : usize = 0x1b52a0;
@@ -220,10 +222,11 @@ fn install_fighter_status_hooks() {
 }
 
 
-static GAME_INFO: Info = Info::new();
+pub(crate) static GAME_INFO: Info = Info::new();
 
 const MATCH_TICK_MS: u64 = 16;
 const SNAPSHOT_COOLDOWN_TICKS: u64 = 120_000 / MATCH_TICK_MS;
+const DUMP_RETRY_TICKS: u64 = 45;
 
 #[derive(Clone, Copy)]
 struct PlayerSnap {
@@ -322,11 +325,57 @@ fn is_game_over(is_results: bool, is_match: bool) -> bool {
 }
 
 #[inline(never)]
+fn game_version() -> String {
+    let mut ver = nnsdk::oe::DisplayVersion { name: [0; 16] };
+    unsafe {
+        nnsdk::oe::GetDisplayVersion(&mut ver);
+    }
+    let n = ver.name.iter().position(|&b| b == 0).unwrap_or(ver.name.len());
+    String::from_utf8_lossy(&ver.name[..n]).into_owned()
+}
+
+#[inline(never)]
 fn dump_game_info_snapshot() -> bool {
-    match serde_json::to_vec(&GAME_INFO) {
-        Ok(mut data) => {
-            data.push(b'\n');
-            results_log::write_snapshot(&data)
+    let log = overrides::results_log();
+    let replay = overrides::replay_save();
+    if !log && !replay {
+        return true;
+    }
+    if !log {
+        return match results_log::timestamp_stem() {
+            Some(stem) => {
+                replay_dump::on_json_written(stem);
+                true
+            }
+            None => false,
+        };
+    }
+    match serde_json::to_value(&GAME_INFO) {
+        Ok(mut value) => {
+            if let Some(obj) = value.as_object_mut() {
+                obj.insert(
+                    "game_version".to_string(),
+                    serde_json::Value::String(game_version()),
+                );
+            }
+            match serde_json::to_vec(&value) {
+                Ok(mut data) => {
+                    data.push(b'\n');
+                    match results_log::write_snapshot(&data) {
+                        Some(stem) => {
+                            if replay {
+                                replay_dump::on_json_written(stem);
+                            }
+                            true
+                        }
+                        None => false,
+                    }
+                }
+                Err(e) => {
+                    println!("[smush_info] results snapshot serialize failed: {}", e);
+                    false
+                }
+            }
         }
         Err(e) => {
             println!("[smush_info] results snapshot serialize failed: {}", e);
@@ -337,13 +386,17 @@ fn dump_game_info_snapshot() -> bool {
 
 struct MatchTickState {
     prev_game_over: bool,
+    prev_is_match: bool,
     saw_match: bool,
+    dumped_this_match: bool,
     ticks_since_dump: u64,
 }
 
 static mut MATCH_TICK: MatchTickState = MatchTickState {
     prev_game_over: false,
+    prev_is_match: false,
     saw_match: false,
+    dumped_this_match: false,
     ticks_since_dump: SNAPSHOT_COOLDOWN_TICKS,
 };
 
@@ -377,6 +430,16 @@ unsafe fn update_match_state(state: &mut MatchTickState) {
         && !FighterManager::is_result_mode(mgr)
         && menu_is_gameplay;
 
+    // The save Yes dialog clears is_result_mode while fighters stay entered,
+    // so is_match rises in the middle of results. saw_match stays set until
+    // both flags are false, which is when we have actually left. Resetting
+    // on that dip drops the in-flight save macro and the pending replay pair,
+    // and the next results tick starts a fresh 7.5s mute.
+    if is_match && !state.prev_is_match && !state.saw_match {
+        replay_dump::on_match_rising();
+        state.dumped_this_match = false;
+        state.ticks_since_dump = DUMP_RETRY_TICKS;
+    }
     if is_match {
         GAME_INFO.remaining_frames.store(get_remaining_time_as_frame(), Ordering::SeqCst);
         GAME_INFO.is_match.store(true, Ordering::SeqCst);
@@ -384,12 +447,21 @@ unsafe fn update_match_state(state: &mut MatchTickState) {
     }
 
     let game_over = state.saw_match && is_game_over(is_results, is_match);
-    if game_over && !state.prev_game_over && state.ticks_since_dump >= SNAPSHOT_COOLDOWN_TICKS {
+    // Stats winner is flaky (timeout, FFA, IC, sudden death). is_results is the
+    // real fallback. Do not require saw_match: match→results gap clears it, HID
+    // still runs, dump would miss. Cooldown is per-match, not 2min of fighter ticks.
+    let want_dump = !state.dumped_this_match
+        && (is_results || (game_over && !state.prev_game_over))
+        && state.ticks_since_dump >= DUMP_RETRY_TICKS;
+    if want_dump {
         if is_results {
             GAME_INFO.is_results_screen.store(true, Ordering::SeqCst);
         }
         let dump: fn() -> bool = dump_game_info_snapshot;
         if std::hint::black_box(dump)() {
+            state.dumped_this_match = true;
+            state.ticks_since_dump = 0;
+        } else {
             state.ticks_since_dump = 0;
         }
     }
@@ -404,6 +476,7 @@ unsafe fn update_match_state(state: &mut MatchTickState) {
     }
 
     GAME_INFO.current_menu.store(current_menu, Ordering::SeqCst);
+    replay_dump::set_results(is_results);
     if !mgr.is_null() && FighterManager::entry_count(mgr) > 0 && menu_is_gameplay {
         GAME_INFO.is_results_screen.store(FighterManager::is_result_mode(mgr), Ordering::SeqCst);
     }
@@ -413,6 +486,7 @@ unsafe fn update_match_state(state: &mut MatchTickState) {
     }
 
     state.prev_game_over = game_over;
+    state.prev_is_match = is_match;
     state.ticks_since_dump = state.ticks_since_dump.saturating_add(1);
 }
 
@@ -623,7 +697,7 @@ static OFFSET3_SEARCH_CODE: &[u8] = &[ //exact
                             //.text:00000071000D7188                 B.EQ            loc_71000D71B4
 ];
 
-fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+pub(crate) fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|window| window == needle)
 }
 
@@ -931,6 +1005,7 @@ fn udp_broadcast_loop() {
 
 #[skyline::main(name = "smush_info")]
 pub fn main() {
+    overrides::load();
     unsafe {
         skyline::nn::ro::LookupSymbol(
             &raw mut FIGHTER_MANAGER_ADDR,
@@ -967,6 +1042,7 @@ pub fn main() {
         special_lw_decide_command_hook,
         special_lw_select_index_hook
     );
+    replay_dump::install();
     install_fighter_frame_hook();
     install_fighter_status_hooks();
 
