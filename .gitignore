@@ -1,6 +1,7 @@
 **/target
 **/*.py
 **/*.pyc
+!tools/scan_nso_offsets.py
 Cargo.lock
 AGENTS.md
 docs/
