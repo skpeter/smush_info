@@ -80,12 +80,18 @@ jobs:
           name: ${{ steps.artifact.outputs.name }}
           path: smush_info-sd.zip
       - name: Upload SD zip to GitHub Release
-        # A called workflow keeps the caller's event name, so workflow_call is never
-        # "release" here. Pass release_tag to upload from workflow_dispatch or workflow_call.
-        if: github.event_name == 'release' || inputs.release_tag
+        # Push to master refreshes the standing "master" release. A called workflow
+        # keeps the caller's event name, so workflow_call is never "release" here;
+        # pass release_tag to attach the zip to some other existing release.
+        # inputs.release_tag alone is not a condition: on push it is null, and
+        # `null != ''` is true, which would upload every branch onto master.
+        if: >-
+          (github.event_name == 'push' && github.ref == 'refs/heads/master') ||
+          github.event_name == 'release' ||
+          inputs.release_tag
         uses: svenstaro/upload-release-action@v2
         with:
           repo_token: ${{ secrets.GITHUB_TOKEN }}
           file: smush_info-sd.zip
-          tag: ${{ inputs.release_tag || github.event.release.tag_name }}
+          tag: ${{ inputs.release_tag || github.event.release.tag_name || 'master' }}
           overwrite: true
