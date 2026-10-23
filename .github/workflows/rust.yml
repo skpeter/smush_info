@@ -7,26 +7,14 @@ on:
         description: Branch, tag, or SHA to build. Leave blank to build the branch selected above.
         required: false
         type: string
-      release_tag:
-        description: Existing GitHub Release tag to attach smush_info-sd.zip to. Leave blank to skip.
-        required: false
-        type: string
-        default: ""
   workflow_call:
     inputs:
       ref:
         description: Branch, tag, or SHA to build. Leave blank to build the caller ref.
         required: false
         type: string
-      release_tag:
-        description: Existing GitHub Release tag to attach smush_info-sd.zip to. Leave blank to skip.
-        required: false
-        type: string
-        default: ""
   push:
   pull_request:
-  release:
-    types: [published]
 
 env:
   CARGO_TERM_COLOR: always
@@ -79,19 +67,28 @@ jobs:
         with:
           name: ${{ steps.artifact.outputs.name }}
           path: smush_info-sd.zip
+      - name: Choose release upload
+        id: release
+        # Master builds refresh the standing "master" release, including a manual
+        # run or a called workflow. Other refs only keep the Actions artifacts.
+        # Compare the checkout ref in the shell: on push, inputs.ref is null, and
+        # `null == ''` is false in an Actions if expression.
+        env:
+          BUILD_REF: ${{ inputs.ref || github.ref }}
+        run: |
+          case "$BUILD_REF" in
+            master|refs/heads/master)
+              echo "upload=true" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "upload=false" >> "$GITHUB_OUTPUT"
+              ;;
+          esac
       - name: Upload SD zip to GitHub Release
-        # Push to master refreshes the standing "master" release. A called workflow
-        # keeps the caller's event name, so workflow_call is never "release" here;
-        # pass release_tag to attach the zip to some other existing release.
-        # inputs.release_tag alone is not a condition: on push it is null, and
-        # `null != ''` is true, which would upload every branch onto master.
-        if: >-
-          (github.event_name == 'push' && github.ref == 'refs/heads/master') ||
-          github.event_name == 'release' ||
-          inputs.release_tag
+        if: steps.release.outputs.upload == 'true'
         uses: svenstaro/upload-release-action@v2
         with:
           repo_token: ${{ secrets.GITHUB_TOKEN }}
           file: smush_info-sd.zip
-          tag: ${{ inputs.release_tag || github.event.release.tag_name || 'master' }}
+          tag: master
           overwrite: true
