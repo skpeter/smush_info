@@ -79,45 +79,15 @@ fn as_pixels(vec: Vector3f) -> Vector2f {
 }
 
 fn send_bytes(socket: i32, mut bytes: &[u8]) -> Result<(), i64> {
-    let mut waits = 0;
     while !bytes.is_empty() {
         unsafe {
             let ret = send(socket, bytes.as_ptr() as *const _, bytes.len(), 0);
             if ret > 0 {
                 bytes = &bytes[ret as usize..];
-                waits = 0;
             } else if ret == 0 {
                 return Err(32);
             } else {
-                let err = *errno_loc();
-                if is_transient_socket_err(err) && waits < 50 {
-                    waits += 1;
-                    std::thread::sleep(Duration::from_millis(1));
-                    continue;
-                }
-                return Err(err);
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Writes as much of `outbound` as the socket will take. A full send buffer
-/// keeps the remainder for the next tick instead of dropping the client.
-fn flush_outbound(socket: i32, outbound: &mut Vec<u8>) -> Result<(), i64> {
-    while !outbound.is_empty() {
-        unsafe {
-            let ret = send(socket, outbound.as_ptr() as *const _, outbound.len(), 0);
-            if ret > 0 {
-                outbound.drain(..ret as usize);
-            } else if ret == 0 {
-                return Err(32);
-            } else {
-                let err = *errno_loc();
-                if is_transient_socket_err(err) {
-                    return Ok(());
-                }
-                return Err(err);
+                return Err(*errno_loc());
             }
         }
     }
@@ -179,29 +149,6 @@ fn set_send_timeout(socket: i32, secs: i64) {
     }
 }
 
-// nn::socket / libnx values. libc's O_NONBLOCK is the newlib flag and is not
-// what the console or Eden check.
-const F_GETFL: i32 = 3;
-const F_SETFL: i32 = 4;
-const O_NONBLOCK_NN: i32 = 0x800;
-
-extern "C" {
-    fn fcntl(fd: i32, cmd: i32, arg: i32) -> i32;
-}
-
-fn is_transient_socket_err(err: i64) -> bool {
-    // 11 EAGAIN, 60 the console's ETIMEDOUT, 110 the emulator's.
-    err == 11 || err == 60 || err == 110
-}
-
-fn set_nonblocking(socket: i32) -> bool {
-    unsafe {
-        let flags = fcntl(socket, F_GETFL, 0);
-        let flags = if flags < 0 { 0 } else { flags };
-        fcntl(socket, F_SETFL, flags | O_NONBLOCK_NN) == 0
-    }
-}
-
 fn recv_some(socket: i32, buf: &mut [u8]) -> Result<Option<usize>, i64> {
     unsafe {
         let n = recv(socket, buf.as_mut_ptr() as *mut _, buf.len(), 0);
@@ -211,7 +158,8 @@ fn recv_some(socket: i32, buf: &mut [u8]) -> Result<Option<usize>, i64> {
             Err(54)
         } else {
             let err = *errno_loc();
-            if is_transient_socket_err(err) {
+            // 11 EAGAIN, 60 the console's ETIMEDOUT, 110 the emulator's.
+            if err == 11 || err == 60 || err == 110 {
                 Ok(None)
             } else {
                 Err(err)
@@ -226,7 +174,6 @@ struct MatchClient {
     probing: bool,
     started: std::time::Instant,
     request: Vec<u8>,
-    outbound: Vec<u8>,
 }
 
 fn drop_client(client: &mut MatchClient) {
@@ -290,9 +237,6 @@ fn accept_clients(listener_socket: i32, incoming: std::sync::mpsc::Sender<i32>) 
                     }
                     break;
                 }
-            }
-            Err(err) if is_transient_socket_err(err) => {
-                std::thread::sleep(Duration::from_millis(16));
             }
             Err(_) => break,
         }
@@ -1193,6 +1137,14 @@ fn start_server() -> Result<(), i64> {
         dbg_err!(setsockopt(
             listener_socket,
             SOL_SOCKET,
+            SO_REUSEADDR,
+            &flags as *const _ as *const c_void,
+            size_of_val(&flags) as u32,
+        ));        
+
+        dbg_err!(setsockopt(
+            listener_socket,
+            SOL_SOCKET,
             SO_KEEPALIVE,
             &flags as *const _ as *const c_void,
             size_of_val(&flags) as u32,
@@ -1205,9 +1157,6 @@ fn start_server() -> Result<(), i64> {
         ));
 
         dbg_err!(listen(listener_socket, 8));
-        if !set_nonblocking(listener_socket) {
-            println!("[smush_info] listener stays blocking");
-        }
         println!("[smush_info] match socket listening on 4242");
         let (incoming_tx, incoming_rx) = std::sync::mpsc::channel();
         let accept_listener = listener_socket;
@@ -1223,9 +1172,6 @@ fn start_server() -> Result<(), i64> {
                             println!("[smush_info] no receive timeout, handshake may block");
                         }
                         println!("[smush_info] match client accepted");
-                        if !set_nonblocking(socket) {
-                            println!("[smush_info] client stays blocking");
-                        }
                         let keepalive: u32 = 1;
                         setsockopt(
                             socket,
@@ -1240,7 +1186,6 @@ fn start_server() -> Result<(), i64> {
                             probing: true,
                             started: std::time::Instant::now(),
                             request: Vec::new(),
-                            outbound: Vec::new(),
                         });
                     }
                     Err(std::sync::mpsc::TryRecvError::Empty) => break,
@@ -1281,22 +1226,13 @@ fn start_server() -> Result<(), i64> {
                         index += 1;
                         continue;
                     }
-                    if clients[index].outbound.is_empty() {
-                        let frame = if clients[index].websocket {
-                            websocket_frame.as_slice()
-                        } else {
-                            tcp_frame.as_slice()
-                        };
-                        clients[index].outbound.extend_from_slice(frame);
-                    }
-                    let socket = clients[index].socket;
-                    let flushed = if clients[index].websocket {
-                        drain_websocket(socket)
-                            .and_then(|_| flush_outbound(socket, &mut clients[index].outbound))
+                    let sent = if clients[index].websocket {
+                        drain_websocket(clients[index].socket)
+                            .and_then(|_| send_bytes(clients[index].socket, &websocket_frame))
                     } else {
-                        flush_outbound(socket, &mut clients[index].outbound)
+                        send_bytes(clients[index].socket, &tcp_frame)
                     };
-                    match flushed {
+                    match sent {
                         Ok(()) => index += 1,
                         Err(errno) => {
                             println!("[smush_info] client dropped (errno {})", errno);
@@ -1652,15 +1588,7 @@ fn search_offsets() {
     }
 }
 
-static TCP_SERVER_STARTED: AtomicBool = AtomicBool::new(false);
-
 fn server_supervisor() {
-    // main() can run again inside the same Eden process. A second bind would
-    // log "listening" while the first host socket still owns the handshakes.
-    if TCP_SERVER_STARTED.swap(true, Ordering::SeqCst) {
-        println!("[smush_info] tcp server already running");
-        return;
-    }
     // Give network stack time to come up (UDP thread uses 5s delay for the same reason).
     std::thread::sleep(Duration::from_secs(2));
     let backoff_steps = [1u64, 2, 5];
