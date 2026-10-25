@@ -36,16 +36,18 @@ mod replay_dump;
 mod udp;
 
 static mut OFFSET1 : usize = 0x1b52a0;
-static mut OFFSET2 : usize = 0x225dc2c;
+static mut OFFSET2 : usize = 0x22de458;
 static mut OFFSET3 : usize = 0xd7140;
 
-// Default 13.0.3 offset
-static mut FIGHTER_SELECTED_OFFSET: usize = 0x66e160;
+// 13.0.5. The hook is the BL 0x10 bytes after this pattern, where X0 is the
+// fighter pointer. The BL immediate itself is not part of the pattern.
+static mut FIGHTER_SELECTED_OFFSET: usize = 0x66e140;
 
 static FIGHTER_SELECTED_SEARCH_CODE: &[u8] = &[
-    0xb0, 0xde, 0x45, 0x94,
-    0xe0, 0x03, 0x1c, 0x32,
-    0xe1, 0x03, 0x1a, 0x32,
+    0xa8, 0x66, 0x40, 0xb9, // ldr w8, [x21, #0x64]
+    0x08, 0x01, 0x00, 0x32, // orr w8, w8, #1
+    0xe0, 0x03, 0x17, 0xaa, // mov x0, x23
+    0xa8, 0x66, 0x00, 0xb9, // str w8, [x21, #0x64]
 ];
 
 extern "C" {
@@ -1563,9 +1565,9 @@ fn search_offsets() {
         let text = std::slice::from_raw_parts(text_ptr, text_size);
 
         if let Some(offset) = find_subsequence(text, FIGHTER_SELECTED_SEARCH_CODE) {
-            FIGHTER_SELECTED_OFFSET = offset;
+            FIGHTER_SELECTED_OFFSET = offset + 0x10;
         } else {
-            println!("Error: no offset found for 'css_fighter_selected'. Defaulting to 13.0.2 offset. This likely won't work.");
+            println!("Error: no offset found for 'css_fighter_selected'. Keeping the built-in 13.0.5 offset.");
         }
     }
 }
