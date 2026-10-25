@@ -1,5 +1,4 @@
 #![feature(proc_macro_hygiene)]
-#![feature(simd_ffi)]
 
 use skyline::hooks::{getRegionAddress, Region, InlineCtx};
 use skyline::from_c_str;
@@ -13,8 +12,6 @@ use smash::app;
 use smash::app::lua_bind::*;
 use smash::lib::lua_const::*;
 use smash::lib::L2CValue;
-use smash::Vector2f;
-use smash::Vector3f;
 
 use smush_info_shared::{
     handshake_response, should_arm_clock_zero, should_write_stats_snapshot, text_frame, Character,
@@ -59,23 +56,6 @@ extern "C" {
 
     #[link_name = "\u{1}_ZN3app14sv_information27get_remaining_time_as_frameEv"]
     pub fn get_remaining_time_as_frame() -> u32;
-
-    #[link_name = "\u{1}_ZN3app17sv_camera_manager15world_to_screenERKN3phx8Vector3fEb"]
-    pub fn world_to_screen(vec: *const Vector3f, unk: bool) -> Float32x2;
-}
-
-#[repr(C)]
-#[derive(Debug, Copy, Clone)]
-pub struct Float32x2 {
-    pub x: f32,
-    pub y: f32,
-}
-
-fn as_pixels(vec: Vector3f) -> Vector2f {
-    unsafe {
-        let screen = world_to_screen(&vec, true);
-        Vector2f { x: screen.x, y: screen.y }
-    }
 }
 
 fn send_bytes(socket: i32, mut bytes: &[u8]) -> Result<(), i64> {
@@ -338,7 +318,9 @@ unsafe extern "C" fn poll_results_after_ko(fighter: &mut SmashlineFighterCommon)
 
 /// One live frame for one fighter. No-op on the results screen, at clock 0,
 /// and once a death has scheduled the KO-camera wait. Does not read
-/// `FighterInformation`. Screen position is updated only on a live frame.
+/// `FighterInformation`. `player.x` / `player.y` stay at 0. Calling
+/// `world_to_screen` from fighter Main crashed on the KO replay camera: the
+/// standing fighter reached it before the death hook stored the deadline.
 unsafe fn sample_live_fighter(fighter: &mut SmashlineFighterCommon) {
     if hooks_quiesced() {
         return;
@@ -371,7 +353,6 @@ unsafe fn sample_live_fighter(fighter: &mut SmashlineFighterCommon) {
     if StatusModule::status_kind(module_accessor) == *FIGHTER_STATUS_KIND_DEAD {
         return;
     }
-    store_screen_position(module_accessor, entry_id as usize);
     match_feed::capture(module_accessor, entry_id as usize);
 }
 
@@ -379,23 +360,6 @@ fn install_results_poll_hook() {
     Agent::new("fighter")
         .on_line(Main, poll_results_after_ko)
         .install();
-}
-
-unsafe fn store_screen_position(
-    module_accessor: *mut app::BattleObjectModuleAccessor,
-    entry: usize,
-) {
-    if entry >= GAME_INFO.players.len() {
-        return;
-    }
-    let pos = Vector3f {
-        x: PostureModule::pos_x(module_accessor),
-        y: PostureModule::pos_y(module_accessor),
-        z: PostureModule::pos_z(module_accessor),
-    };
-    let screen = as_pixels(pos);
-    GAME_INFO.players[entry].x.store(screen.x, Ordering::SeqCst);
-    GAME_INFO.players[entry].y.store(screen.y, Ordering::SeqCst);
 }
 
 unsafe extern "C" fn handle_pre_entry(fighter: &mut SmashlineFighterCommon) -> L2CValue {
@@ -989,7 +953,6 @@ unsafe fn update_match_state(state: &mut MatchTickState, on_game_thread: bool) {
 
     let game_over = state.saw_match && is_game_over(is_results, is_match);
     // Clock at 0 or last stock ends stat sampling. Sudden death is discarded.
-    // Screen position is not part of this and keeps updating on Main.
     let time_up = is_match && GAME_INFO.remaining_frames.load(Ordering::SeqCst) == 0;
     let match_finished = is_results || time_up || stock_match_decided();
     // gstack-shortcut(dec-6ea7e982-17b2-4d92-824f-8fa6f2edd87d): 6/10, upgrade when Spirits, Classic, and World of Light menu ids are known
@@ -1719,9 +1682,8 @@ pub fn main() {
     );
     replay_dump::install();
     // Main samples a live 1v1 and polls for the results screen a few seconds
-    // after a death. It does not read fighter modules on the KO camera frame.
-    // The same hook arms the replay save. Screen position is updated only on
-    // live frames, not on the death status.
+    // after a death. It does not read fighter modules or the camera on the KO
+    // camera frame. The same hook arms the replay save.
     install_results_poll_hook();
     install_fighter_status_hooks();
 
