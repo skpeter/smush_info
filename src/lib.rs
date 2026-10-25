@@ -114,19 +114,31 @@ struct timeval {
     tv_usec: i64,
 }
 
+/// The console takes a 16-byte `timeval`. Emulators read a 4-byte millisecond
+/// count and ignore the rest, which turns a 1 ms timeout into a blocking recv.
+/// Send both forms; the one the host rejects leaves the other in place.
 fn set_sock_timeout(socket: i32, option: i32, millis: i64) -> bool {
     unsafe {
         let tv = timeval {
             tv_sec: millis / 1000,
             tv_usec: (millis % 1000) * 1000,
         };
-        setsockopt(
+        let bsd = setsockopt(
             socket,
             SOL_SOCKET,
             option,
             &tv as *const _ as *const c_void,
             size_of_val(&tv) as u32,
-        ) == 0
+        ) == 0;
+        let ms = millis as u32;
+        let emulated = setsockopt(
+            socket,
+            SOL_SOCKET,
+            option,
+            &ms as *const _ as *const c_void,
+            size_of_val(&ms) as u32,
+        ) == 0;
+        bsd || emulated
     }
 }
 
@@ -146,7 +158,8 @@ fn recv_some(socket: i32, buf: &mut [u8]) -> Result<Option<usize>, i64> {
             Err(54)
         } else {
             let err = *errno_loc();
-            if err == 11 || err == 60 {
+            // 11 EAGAIN, 60 the console's ETIMEDOUT, 110 the emulator's.
+            if err == 11 || err == 60 || err == 110 {
                 Ok(None)
             } else {
                 Err(err)
@@ -1155,7 +1168,10 @@ fn start_server() -> Result<(), i64> {
                 match incoming_rx.try_recv() {
                     Ok(socket) => {
                         set_send_timeout(socket, 3);
-                        let _ = set_sock_timeout(socket, SO_RCVTIMEO, 1);
+                        if !set_sock_timeout(socket, SO_RCVTIMEO, 1) {
+                            println!("[smush_info] no receive timeout, handshake may block");
+                        }
+                        println!("[smush_info] match client accepted");
                         let keepalive: u32 = 1;
                         setsockopt(
                             socket,
