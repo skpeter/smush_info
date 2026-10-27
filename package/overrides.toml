@@ -1,5 +1,8 @@
 # Uncomment a flag to disable that feature.
 # Missing file = all features on.
+# emulator_mode: auto (default) is on when sd:/atmosphere/package3 is missing.
+# on skips Vault playback game calls. off never does. Consoles with package3 stay off.
+emulator_mode = "auto"
 [smush_info]
 disable_list = [
     # "disable_results_log",

@@ -64,7 +64,56 @@ CODE_PATTERNS = [
         -4,
         "hardcoded in lib.rs, hook is the BL just before this epilogue",
     ),
+    (
+        # void submit(Task* this). When [this+0xfc] is 0 it builds
+        # save:/save_data/replay/...replay....bin and enqueues it. The ADRP of
+        # that directory is inside an earlier state, not this entry.
+        # Same text offset on 13.0.4 and 13.0.5.
+        "REPLAY_SUBMIT",
+        bytes([
+            0xFC, 0x67, 0xBB, 0xA9, 0xF8, 0x5F, 0x01, 0xA9, 0xF6, 0x57, 0x02, 0xA9,
+            0xF4, 0x4F, 0x03, 0xA9, 0xFD, 0x7B, 0x04, 0xA9, 0xFD, 0x03, 0x01, 0x91,
+            0xFF, 0x03, 0x0C, 0xD1, 0x08, 0xFC, 0x40, 0xB9,
+        ]),
+        0,
+        "one argument in x0. Task comes from REPLAY_TASK_SLOT",
+    ),
+    (
+        # void ctor(Box*). Allocates the task (align 16, size 0x1a0) and stores it
+        # in the box. The BL at +0x1c is the allocator the menu also uses for the box.
+        "REPLAY_TASK_CTOR",
+        bytes([
+            0xFF, 0xC3, 0x00, 0xD1, 0xF4, 0x4F, 0x01, 0xA9, 0xFD, 0x7B, 0x02, 0xA9,
+            0xFD, 0x83, 0x00, 0x91, 0xF3, 0x03, 0x00, 0xAA, 0x01, 0x34, 0x80, 0x52,
+            0xE0, 0x03, 0x1C, 0x32,
+        ]),
+        0,
+        "menu calls this after alloc(0x10, 8). BL at +0x1c is the allocator",
+    ),
+    (
+        # Results pump. The menu calls this once a frame after the constructor.
+        "REPLAY_TASK_PUMP",
+        bytes([
+            0xF3, 0x0F, 0x1E, 0xF8, 0xFD, 0x7B, 0x01, 0xA9, 0xFD, 0x43, 0x00, 0x91,
+            0x08, 0xF4, 0x80, 0xB9, 0x1F, 0x4D, 0x00, 0x71, 0x42, 0x07, 0x00, 0x54,
+            0x08, 0x08, 0x08, 0x8B, 0x08, 0xA9, 0x40, 0xB9,
+        ]),
+        0,
+        "one argument in x0, the task. Same text offset on 13.0.4 and 13.0.5",
+    ),
 ]
+
+# ldr x8, [x8, #0xf0]; add x0, x8, #0x588; ldr x8, [x8, #0x588]; ldr x8, [x8, #0x18]
+# The ADRP of the replay manager is the instruction immediately before this.
+# Every site names the same global. The menu calls vtable+0x18 and stores at task+0x198.
+REPLAY_SOURCE_LOAD = bytes([
+    0x08, 0x79, 0x40, 0xF9, 0x00, 0x21, 0x16, 0x91, 0x08, 0xC5, 0x42, 0xF9, 0x08, 0x0D, 0x40, 0xF9,
+])
+
+# ldr x8, [x8, #0x5b8]; mov x19, x0; ldr x0, [x8]
+# The ADRP of the task box is the instruction immediately before this.
+# 13.0.5 has two copies (results update); both name the same slot.
+REPLAY_TASK_SLOT = bytes([0x08, 0xDD, 0x42, 0xF9, 0xF3, 0x03, 0x00, 0xAA, 0x00, 0x01, 0x40, 0xF9])
 
 # Stable instructions immediately before an ADRP of that global.
 # 13.0.4 and 13.0.5 keep PLAYER_TAG 0x4EDB8 bytes below PLAYER_SAVE. The tag
@@ -217,7 +266,19 @@ def main() -> None:
     print()
     print("code hooks")
     for name, needle, delta, note in CODE_PATTERNS:
-        report_code(text, name, needle, delta, note)
+        hook = report_code(text, name, needle, delta, note)
+        if name == "REPLAY_TASK_CTOR" and hook is not None:
+            bl = hook + 0x1C
+            word = u32(text, bl)
+            if (word & 0xFC000000) == 0x94000000:
+                imm = word & 0x03FFFFFF
+                if imm & 0x02000000:
+                    imm -= 0x04000000
+                alloc = (bl + imm * 4) & 0xFFFFFFFF
+                print(
+                    f"  {'REPLAY_TASK_ALLOC':<24} 0x{alloc:x}  "
+                    "alloc(align, size), from the ctor's BL"
+                )
 
     print()
     print("data offsets")
@@ -246,6 +307,48 @@ def main() -> None:
         menu = found.get("MENU")
         if menu is not None:
             print(f"  gap SAVE-MENU 0x{save - menu:x}  gap SAVE-TAG 0x{save - tag:x}")
+
+    print()
+    print("replay save")
+    slots = []
+    for hit in find_all(text, REPLAY_TASK_SLOT):
+        adrp = hit - 4
+        if adrp < 0:
+            continue
+        word = u32(text, adrp)
+        if (word & 0x9F000000) != 0x90000000 or (word & 0x1F) != 8:
+            continue
+        slots.append(adrp_page(adrp, word) + 0x5B8)
+    if not slots:
+        print("  REPLAY_TASK_SLOT         0 hits")
+    elif any(slot != slots[0] for slot in slots):
+        print(f"  REPLAY_TASK_SLOT         {len(slots)} disagreeing hits")
+    else:
+        slot = slots[0]
+        print(
+            f"  {'REPLAY_TASK_SLOT':<24} 0x{slot:x}  {section_of(nso, slot)}  "
+            f"{len(slots)} sites. task = *(u64*)(*(u64*)slot)"
+        )
+
+    sources = []
+    for hit in find_all(text, REPLAY_SOURCE_LOAD):
+        adrp = hit - 4
+        if adrp < 0:
+            continue
+        word = u32(text, adrp)
+        if (word & 0x9F000000) != 0x90000000 or (word & 0x1F) != 8:
+            continue
+        sources.append(adrp_page(adrp, word) + 0xF0)
+    if not sources:
+        print("  REPLAY_SOURCE            0 hits")
+    elif any(src != sources[0] for src in sources):
+        print(f"  REPLAY_SOURCE            {len(sources)} disagreeing hits")
+    else:
+        src = sources[0]
+        print(
+            f"  {'REPLAY_SOURCE':<24} 0x{src:x}  {section_of(nso, src)}  "
+            f"{len(sources)} sites. *(u64*)slot is the replay manager"
+        )
 
 
 if __name__ == "__main__":

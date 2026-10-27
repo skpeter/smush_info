@@ -17,8 +17,9 @@ use smash::Vector2f;
 use smash::Vector3f;
 
 use smush_info_shared::{
-    handshake_response, should_arm_clock_zero, should_write_stats_snapshot, text_frame, Character,
-    Info,
+    clear_results_session, handshake_response, menu_is_gameplay, menu_is_vault,
+    new_match_resets_save, should_arm_clock_zero, should_submit, should_write_stats_snapshot,
+    text_frame, Character, Info,
 };
 use lazy_static::lazy_static;
 
@@ -288,9 +289,19 @@ fn cancel_result_poll() {
     RESULT_POLL_NOT_BEFORE.store(0, Ordering::SeqCst);
 }
 
+/// Vault playback on Eden. Consoles resolve `emulator_mode` off and never read the menu here.
+pub(crate) unsafe fn emulator_vault_inert() -> bool {
+    if !overrides::emulator_mode() {
+        return false;
+    }
+    let menu: u32 = *(offset_to_addr(MENU_OFFSET) as *const u32);
+    menu_is_vault(menu)
+}
+
 /// Live socket flags. The TCP thread must not call `FighterManager` (that races
 /// replay teardown). Stage select used to clear `is_results_screen`; replays never
 /// take that path, so the results latch stayed on for the next game.
+/// Vault playback still publishes this. SMART starts a game from these flags.
 unsafe fn refresh_reported_match() {
     let mgr: *mut app::FighterManager = if FIGHTER_MANAGER_ADDR == 0 {
         std::ptr::null_mut()
@@ -298,9 +309,8 @@ unsafe fn refresh_reported_match() {
         *(FIGHTER_MANAGER_ADDR as *mut *mut app::FighterManager)
     };
     let current_menu: u32 = *(offset_to_addr(MENU_OFFSET) as *const u32);
-    const CONTROLS_SCREEN_MENU: u32 = 0x6020000;
-    const MII_MAKER_MENU: u32 = 0x4050000;
-    let menu_is_gameplay = current_menu != CONTROLS_SCREEN_MENU && current_menu != MII_MAKER_MENU;
+    // Controls and Mii Maker pose fighters (a sandbag and Mario) without being a match.
+    let menu_is_gameplay = menu_is_gameplay(current_menu);
     let has_entries = !mgr.is_null() && FighterManager::entry_count(mgr) > 0 && menu_is_gameplay;
     let result_mode = has_entries && FighterManager::is_result_mode(mgr);
     let in_match = has_entries && !result_mode;
@@ -317,14 +327,14 @@ unsafe fn refresh_reported_match() {
 
 /// Installed so the results read runs on the game thread. Returns before any
 /// fighter-module read while a death is pending. The KO camera frame only stores
-/// that deadline. While no death is pending, refresh the socket flags and sample.
+/// that deadline. While no death is pending, sample this fighter. The socket
+/// flags refresh once per frame inside `tick_match_once_per_frame`.
 unsafe extern "C" fn poll_results_after_ko(fighter: &mut SmashlineFighterCommon) {
     // Replay save and the results file arm from this tick. Once per frame, including
     // the KO-camera wait. This does not read fighter modules or the camera.
     tick_match_once_per_frame();
     let due = RESULT_POLL_NOT_BEFORE.load(Ordering::SeqCst);
     if due == 0 {
-        refresh_reported_match();
         sample_live_fighter(fighter);
         return;
     }
@@ -927,6 +937,11 @@ fn tick_match_once_per_frame() {
         return;
     }
     tick_match_state(true);
+    // Same values for every fighter in the frame. A pending KO-camera read
+    // still skips this, so the results timer is not published during that wait.
+    if RESULT_POLL_NOT_BEFORE.load(Ordering::SeqCst) == 0 {
+        unsafe { refresh_reported_match() };
+    }
 }
 
 #[inline(never)]
@@ -948,7 +963,7 @@ fn tick_match_state(on_game_thread: bool) {
         }
         return;
     }
-    {
+    let pump = {
         let mut state = match MATCH_TICK.lock() {
             Ok(s) => s,
             Err(poisoned) => poisoned.into_inner(),
@@ -956,12 +971,27 @@ fn tick_match_state(on_game_thread: bool) {
         unsafe {
             update_match_state(&mut state, true);
         }
+        // Pumping continues for the whole dump wait. The task waits on the
+        // worker between calls, so once a frame is enough.
+        replay_dump::take_direct_save();
+        should_submit(replay_submit_offset(), replay_dump::direct_wait_active())
+    };
+    if pump {
+        unsafe { pump_replay_save() };
+    } else {
+        unsafe { end_replay_pump() };
     }
     request_large_stack_flush();
 }
 
 #[inline(never)]
 unsafe fn update_match_state(state: &mut MatchTickState, on_game_thread: bool) {
+    // Playback looks like a finished match. Publishing the feed is what SMART
+    // scores. Arming replay save here would press A through the Vault UI.
+    if emulator_vault_inert() {
+        replay_dump::set_results(false);
+        return;
+    }
     reopen_match_state_if_idle(state);
     // FighterManager singleton may not exist yet (early in app boot, before title screen)
     // and FIGHTER_MANAGER_ADDR can be 0 if LookupSymbol failed. Treat both as "no match"
@@ -972,9 +1002,8 @@ unsafe fn update_match_state(state: &mut MatchTickState, on_game_thread: bool) {
         *(FIGHTER_MANAGER_ADDR as *mut *mut app::FighterManager)
     };
     let current_menu: u32 = *(offset_to_addr(MENU_OFFSET) as *const u32);
-    const CONTROLS_SCREEN_MENU: u32 = 0x6020000; //is_match is set to true when the player in the controls screen, i assume because there is a sandbag and mario. this ensures we're not in the controls screen
-    const MII_MAKER_MENU: u32 = 0x4050000; //performs same check to make sure we're not on mii maker
-    let menu_is_gameplay = current_menu != CONTROLS_SCREEN_MENU && current_menu != MII_MAKER_MENU;
+    // Controls and Mii Maker pose fighters (a sandbag and Mario) without being a match.
+    let menu_is_gameplay = menu_is_gameplay(current_menu);
     let is_results = !mgr.is_null()
         && FighterManager::entry_count(mgr) > 0
         && menu_is_gameplay
@@ -987,9 +1016,9 @@ unsafe fn update_match_state(state: &mut MatchTickState, on_game_thread: bool) {
     // The save Yes dialog clears is_result_mode while fighters stay entered,
     // so is_match rises in the middle of results. saw_match stays set until
     // both flags are false, which is when we have actually left. Resetting
-    // on that dip drops the in-flight save macro and the pending replay pair,
+    // on that dip drops the in-flight save and the pending replay pair,
     // and the next results tick starts a fresh 7.5s mute.
-    if is_match && !state.prev_is_match && !state.saw_match {
+    if new_match_resets_save(is_match, state.prev_is_match, state.saw_match) {
         replay_dump::on_match_rising();
         state.dumped_this_match = false;
         state.ticks_since_dump = DUMP_RETRY_TICKS;
@@ -1085,7 +1114,7 @@ unsafe fn update_match_state(state: &mut MatchTickState, on_game_thread: bool) {
         GAME_INFO.is_results_screen.store(FighterManager::is_result_mode(mgr), Ordering::SeqCst);
     }
 
-    if !is_match && !is_results {
+    if clear_results_session(is_match, is_results) {
         state.saw_match = false;
     }
 
@@ -1425,14 +1454,44 @@ pub unsafe fn set_player_information(module_accessor: &mut app::BattleObjectModu
 }
 
 // UPDATE_TAG unchanged across 13.0.4/13.0.5. Data offsets slide +0x1000 on 13.0.5;
-// stage select is a code offset (+0x450). Defaults are 13.0.5; apply_version_offsets()
-// rewinds them for older display versions.
+// stage select is a code offset (+0x450). Submit, the task constructor, and the
+// pump share a text offset. The allocator, task slot, and replay-source global
+// do not. Defaults are 13.0.5; apply_version_offsets() rewinds them for 13.0.4.
 static UPDATE_TAG_FOR_PLAYER_OFFSET: usize = 0x19fd0b0;
 static mut PLAYER_SAVE_OFFSET: usize = 0x5314510;
 static mut PLAYER_SAVE_ADDRESS: *const u64 = 0x0 as *const u64;
 static mut PLAYER_TAG_OFFSET: usize = 0x52C5758;
 static mut MENU_OFFSET: usize = 0x53050f0;
 static mut STAGE_SELECTED_OFFSET: usize = 0x23355d4;
+// `void submit(Task*)`. Same text offset on 13.0.4 and 13.0.5. The pump is what
+// runs; a zero offset means the entry was not found and must not be called.
+static mut REPLAY_SUBMIT_OFFSET: usize = 0x143d5d0;
+// BSS box. `task = *(u64*)(*(u64*)(image + slot))`.
+static mut REPLAY_TASK_SLOT_OFFSET: usize = 0x52c35b8;
+// Results menu: alloc(align, size) then `ctor(box)` which stores the task in the box.
+// The menu only runs this from its save step, which the direct path never enters.
+static mut REPLAY_TASK_ALLOC_OFFSET: usize = 0x392e290;
+static mut REPLAY_TASK_CTOR_OFFSET: usize = 0x143e850;
+// `*(u64*)(image + slot)` is the replay manager. The menu calls
+// `(*(manager+0x588))[0x18/8](manager+0x588)` and stores the result at task+0x198.
+// The write callback bails when that field is still 0.
+static mut REPLAY_SOURCE_OFFSET: usize = 0x52c50f0;
+// Results pump. The menu calls this once a frame. State 1 enqueues, then
+// later frames wait until the worker sets task+0x11c before advancing.
+// Calling submit on the same tick replaces that callback, so the worker
+// never opens a file.
+static mut REPLAY_TASK_PUMP_OFFSET: usize = 0x143ea40;
+/// Match ticks are once a millisecond. The results menu pumps once a frame,
+/// and spinning the state machine faster than that hitches the results screen.
+const REPLAY_PUMP_INTERVAL_MS: u64 = 16;
+static mut PUMP_LIVE: bool = false;
+static mut PUMP_BUSY: bool = false;
+static mut PUMP_TASK: u64 = 0;
+static mut PUMP_NOT_BEFORE: u64 = 0;
+
+pub(crate) fn replay_submit_offset() -> usize {
+    unsafe { REPLAY_SUBMIT_OFFSET }
+}
 
 fn display_version() -> String {
     skyline::nn::oe::get_display_version()
@@ -1461,14 +1520,141 @@ unsafe fn apply_version_offsets() {
         PLAYER_TAG_OFFSET = 0x52C5758;
         MENU_OFFSET = 0x53050f0;
         STAGE_SELECTED_OFFSET = 0x23355d4;
+        REPLAY_SUBMIT_OFFSET = 0x143d5d0;
+        REPLAY_TASK_SLOT_OFFSET = 0x52c35b8;
+        REPLAY_TASK_ALLOC_OFFSET = 0x392e290;
+        REPLAY_TASK_CTOR_OFFSET = 0x143e850;
+        REPLAY_SOURCE_OFFSET = 0x52c50f0;
+        REPLAY_TASK_PUMP_OFFSET = 0x143ea40;
         println!("[smush_info] game {} — using 13.0.5 offsets", version);
     } else {
         PLAYER_SAVE_OFFSET = 0x5313510;
         PLAYER_TAG_OFFSET = 0x52C4758;
         MENU_OFFSET = 0x53040f0;
         STAGE_SELECTED_OFFSET = 0x2335184;
+        REPLAY_SUBMIT_OFFSET = 0x143d5d0;
+        REPLAY_TASK_SLOT_OFFSET = 0x52c25b8;
+        REPLAY_TASK_ALLOC_OFFSET = 0x392dce0;
+        REPLAY_TASK_CTOR_OFFSET = 0x143e850;
+        REPLAY_SOURCE_OFFSET = 0x52c40f0;
+        REPLAY_TASK_PUMP_OFFSET = 0x143ea40;
         println!("[smush_info] game {} — using 13.0.4 offsets", version);
     }
+}
+
+/// Allocate the 8-byte box and run the results-menu constructor.
+/// Returns 0 when the allocator or the constructor offset is missing.
+#[inline(never)]
+unsafe fn make_replay_task_box() -> u64 {
+    let alloc_off = REPLAY_TASK_ALLOC_OFFSET;
+    let ctor_off = REPLAY_TASK_CTOR_OFFSET;
+    if alloc_off == 0 || ctor_off == 0 {
+        return 0;
+    }
+    let alloc: unsafe extern "C" fn(u64, u64) -> u64 =
+        std::mem::transmute(offset_to_addr(alloc_off) as *const ());
+    let ctor: unsafe extern "C" fn(u64) =
+        std::mem::transmute(offset_to_addr(ctor_off) as *const ());
+    // Same arguments the results menu passes: align 16, size 8.
+    let box_ptr = std::hint::black_box(alloc)(0x10, 8);
+    if box_ptr == 0 {
+        return 0;
+    }
+    std::hint::black_box(ctor)(box_ptr);
+    box_ptr
+}
+
+/// Same call the results menu makes after the constructor. Returns the pointer
+/// stored at `task+0x198`, or 0 when the manager is not there.
+#[inline(never)]
+unsafe fn attach_replay_source(task: u64) -> u64 {
+    let slot_off = REPLAY_SOURCE_OFFSET;
+    if slot_off == 0 || task == 0 {
+        return 0;
+    }
+    let root = *(offset_to_addr(slot_off) as *const u64);
+    if root == 0 {
+        return 0;
+    }
+    let vt = *((root + 0x588) as *const u64);
+    if vt == 0 {
+        return 0;
+    }
+    let method = *((vt + 0x18) as *const u64);
+    if method == 0 {
+        return 0;
+    }
+    let fetch: unsafe extern "C" fn(u64) -> u64 =
+        std::mem::transmute(method as *const ());
+    let replay = std::hint::black_box(fetch)(root + 0x588);
+    *((task + 0x198) as *mut u64) = replay;
+    replay
+}
+
+/// Drop the in-flight pump so the next dump wait builds a new task.
+unsafe fn end_replay_pump() {
+    PUMP_LIVE = false;
+    PUMP_TASK = 0;
+    PUMP_NOT_BEFORE = 0;
+}
+
+/// Build the task the way the results menu does, once per dump wait.
+/// A fresh box each wait: a finished task left in the slot would not save again.
+unsafe fn start_replay_task() -> bool {
+    let slot_off = REPLAY_TASK_SLOT_OFFSET;
+    let pump_off = REPLAY_TASK_PUMP_OFFSET;
+    if slot_off == 0 || pump_off == 0 {
+        return false;
+    }
+    let box_ptr = make_replay_task_box();
+    if box_ptr == 0 {
+        return false;
+    }
+    let slot = offset_to_addr(slot_off) as *mut u64;
+    *slot = box_ptr;
+    let task = *(box_ptr as *const u64);
+    if task == 0 {
+        return false;
+    }
+    attach_replay_source(task);
+    *((task as *mut u8).add(0xa8) as *mut i32) = 1;
+    *((task as *mut u8).add(0x108) as *mut u32) = 0;
+    PUMP_TASK = task;
+    true
+}
+
+/// One pump about every frame. The menu does this until `task+0x108` is 1 or 2.
+/// Submit is a later state; calling it here overwrites the callback state 1 queued.
+#[inline(never)]
+unsafe fn pump_replay_save() {
+    if PUMP_BUSY {
+        return;
+    }
+    let now = mono_ms();
+    if PUMP_LIVE && now < PUMP_NOT_BEFORE {
+        return;
+    }
+    PUMP_BUSY = true;
+    if !PUMP_LIVE {
+        if !start_replay_task() {
+            PUMP_BUSY = false;
+            return;
+        }
+        PUMP_LIVE = true;
+    }
+    let task = PUMP_TASK;
+    let status_now = *((task as *const u8).add(0x108) as *const u32);
+    if status_now == 1 || status_now == 2 {
+        PUMP_NOT_BEFORE = u64::MAX;
+        PUMP_BUSY = false;
+        return;
+    }
+    let pump_off = REPLAY_TASK_PUMP_OFFSET;
+    let pump: unsafe extern "C" fn(u64) -> u32 =
+        std::mem::transmute(offset_to_addr(pump_off) as *const ());
+    std::hint::black_box(pump)(task);
+    PUMP_NOT_BEFORE = now.saturating_add(REPLAY_PUMP_INTERVAL_MS);
+    PUMP_BUSY = false;
 }
 
 pub fn get_tag_of_player(player_index: usize) -> String {

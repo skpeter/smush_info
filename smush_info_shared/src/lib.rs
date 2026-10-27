@@ -30,6 +30,18 @@ pub use ws::{handshake_response, text_frame};
 
 pub mod hid_route;
 
+mod menu;
+pub use menu::{menu_is_gameplay, menu_is_vault, CONTROLS_SCREEN_MENU, MII_MAKER_MENU, VAULT_MENU};
+
+mod emulator_mode;
+pub use emulator_mode::{parse_emulator_mode, resolve_emulator_mode, EmulatorMode};
+
+mod replay_save;
+pub use replay_save::{
+    clear_results_session, new_match_resets_save, pause_deadline, save_wait_result,
+    should_arm_save, should_submit, skip_phase_done, SaveWait, PAUSE_GAP_MS, SKIP_PULSE_MS,
+};
+
 #[derive(Serialize, Deserialize, Debug)]
 pub struct Info {
     pub arena_id: AtomicArenaId,
