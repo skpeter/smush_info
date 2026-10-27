@@ -65,7 +65,7 @@ atmosphere/contents/01006A800016E000/romfs/skyline/plugins/libsmush_info.nro
 ultimate/smush_info/overrides.toml
 ```
 
-On boot, plugin reads `sd:/ultimate/smush_info/overrides.toml` if present. Uncomment a `disable_*` flag to turn that feature off. `debug_mode` is the other way around: trace lines stay off unless that line is uncommented. Missing file = features on, debug off.
+On boot, plugin reads `sd:/ultimate/smush_info/overrides.toml` if present. Uncomment a flag to disable that feature. Missing file or all flags commented = everything on.
 
 ```toml
 [smush_info]
@@ -73,14 +73,12 @@ disable_list = [
     # "disable_results_log",
     # "disable_replay_save",
     # "disable_results_skip",
-    # "debug_mode",
 ]
 ```
 
 - `disable_results_log` — no `{stem}.log` snapshot
 - `disable_replay_save` — no auto save seq, no SD dump, no vault delete
 - `disable_results_skip` — no all-pad A exit after save
-- `debug_mode` — print trace lines (menu, match phase, capture, vault delete). Off unless uncommented.
 
 # How to Build and Install
 You must have Rust and Cargo installed. [Click here](https://www.rust-lang.org/tools/install) for instructions on how to install based on your system.

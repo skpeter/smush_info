@@ -1,10 +1,8 @@
-# Uncomment a disable_* flag to turn that feature off.
-# Uncomment debug_mode to print trace lines. It stays off unless present.
-# Missing file = features on, debug off.
+# Uncomment a flag to disable that feature.
+# Missing file = all features on.
 [smush_info]
 disable_list = [
     # "disable_results_log",
     # "disable_replay_save",
     # "disable_results_skip",
-    # "debug_mode",
 ]

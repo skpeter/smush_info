@@ -220,10 +220,7 @@ fn eligible_path(path: &str, confirmed: bool) -> bool {
     if confirmed {
         return path.contains("save_data/replay");
     }
-    // The vault lives on the save mount. Matching any path holding "replay"
-    // also captured other plugins' SD logs, which then sat in the orphan list
-    // and kept the probe window open for the rest of the session.
-    path.contains("replay") && path.contains("save")
+    path.contains("replay")
 }
 
 fn maybe_probe(st: &mut DumpState, path: &str, mode: i32) {
@@ -317,11 +314,6 @@ fn delete_vault_after_export(path: &str) {
     if !crate::overrides::replay_save() {
         return;
     }
-    // Never unlink a vault file while the Vault owns the screen: autoplay is
-    // walking that list and the next entry may be the one being deleted.
-    if crate::in_vault_menu() {
-        return;
-    }
     if !vault_path_ok(path) {
         return;
     }
@@ -333,9 +325,7 @@ fn delete_vault_after_export(path: &str) {
         bytes.push(0);
     }
     let rc = unsafe { delete_file(bytes.as_ptr()) };
-    if crate::overrides::debug_mode() {
-        println!("[smush_info] trace: vault delete {} rc {:#x}", path, rc);
-    }
+    let _ = rc;
 }
 
 fn pick_best(files: &[Capture]) -> Option<usize> {
@@ -421,13 +411,7 @@ pub fn on_match_rising() {
 #[inline(never)]
 pub fn set_results(is_results: bool) {
     let mut st = lock_state();
-    // Playback ends in result mode. Starting the save macro here drives
-    // A / Y / Right through the vault UI and crashes the game.
-    if crate::overrides::hid_enabled()
-        && is_results
-        && !st.results
-        && !crate::in_vault_menu()
-    {
+    if crate::overrides::hid_enabled() && is_results && !st.results {
         st.begin_hid_session();
     }
     st.results = is_results;
@@ -1076,12 +1060,6 @@ fn install_npad_abs_hooks() {
 }
 
 unsafe fn live_is_results() -> bool {
-    // Replay playback ends in result mode with two fighters entered. Masking
-    // pads there would drive A / Y / Right through the vault UI. Controls and
-    // Mii Maker are not a results screen either.
-    if crate::in_vault_menu() || !crate::in_gameplay_menu() {
-        return false;
-    }
     if crate::FIGHTER_MANAGER_ADDR == 0 {
         return false;
     }
@@ -1337,9 +1315,6 @@ pub fn open_file_hook(
             && (mode & WRITE_BIT) != 0
             && eligible_path(&path_s, st.path_confirmed)
         {
-            if crate::overrides::debug_mode() {
-                println!("[smush_info] trace: capture open {}", path_s);
-            }
             st.captures.insert(
                 h,
                 Capture {
@@ -1393,15 +1368,6 @@ pub fn close_file_hook(handle: nnsdk::fs::FileHandle) {
         st.captures.remove(&handle.handle)
     };
     if let Some(cap) = cap {
-        if crate::overrides::debug_mode() {
-            println!(
-                "[smush_info] trace: capture close {} len {} magic {} truncated {}",
-                cap.path,
-                cap.buf.len(),
-                magic_score(&cap.buf),
-                cap.truncated
-            );
-        }
         finish_close(cap);
     }
 }

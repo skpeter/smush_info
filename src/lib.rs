@@ -288,40 +288,6 @@ fn cancel_result_poll() {
     RESULT_POLL_NOT_BEFORE.store(0, Ordering::SeqCst);
 }
 
-// `is_match` goes true wherever fighters are entered, which includes screens
-// that are not a match being played. The controls screen poses a sandbag and
-// Mario; mii maker does the same. Vault replay playback is a match: SMART
-// starts a game from `is_match` and a decreasing timer, and ends it from the
-// results screen or stocks. Only the results macro and the vault delete stay
-// off there. Injected results input walks the game into a null map lookup,
-// and deleting the file removes the one autoplay opens next.
-const CONTROLS_SCREEN_MENU: u32 = 0x6020000;
-const MII_MAKER_MENU: u32 = 0x4050000;
-/// The top byte of the menu word is the top-level menu. 0x05 is the Vault
-/// (replay playback reports 0x5010100).
-const VAULT_MENU: u32 = 0x5000000;
-const TOP_LEVEL_MENU_MASK: u32 = 0xff000000;
-
-fn menu_word_is_gameplay(menu: u32) -> bool {
-    menu != CONTROLS_SCREEN_MENU && menu != MII_MAKER_MENU
-}
-
-fn menu_word_is_vault(menu: u32) -> bool {
-    (menu & TOP_LEVEL_MENU_MASK) == VAULT_MENU
-}
-
-/// Read the live menu word. Controls and Mii Maker are not a match. Vault
-/// playback is.
-pub(crate) fn in_gameplay_menu() -> bool {
-    let menu: u32 = unsafe { *(offset_to_addr(MENU_OFFSET) as *const u32) };
-    menu_word_is_gameplay(menu)
-}
-
-pub(crate) fn in_vault_menu() -> bool {
-    let menu: u32 = unsafe { *(offset_to_addr(MENU_OFFSET) as *const u32) };
-    menu_word_is_vault(menu)
-}
-
 /// Live socket flags. The TCP thread must not call `FighterManager` (that races
 /// replay teardown). Stage select used to clear `is_results_screen`; replays never
 /// take that path, so the results latch stayed on for the next game.
@@ -332,7 +298,9 @@ unsafe fn refresh_reported_match() {
         *(FIGHTER_MANAGER_ADDR as *mut *mut app::FighterManager)
     };
     let current_menu: u32 = *(offset_to_addr(MENU_OFFSET) as *const u32);
-    let menu_is_gameplay = menu_word_is_gameplay(current_menu);
+    const CONTROLS_SCREEN_MENU: u32 = 0x6020000;
+    const MII_MAKER_MENU: u32 = 0x4050000;
+    let menu_is_gameplay = current_menu != CONTROLS_SCREEN_MENU && current_menu != MII_MAKER_MENU;
     let has_entries = !mgr.is_null() && FighterManager::entry_count(mgr) > 0 && menu_is_gameplay;
     let result_mode = has_entries && FighterManager::is_result_mode(mgr);
     let in_match = has_entries && !result_mode;
@@ -444,9 +412,6 @@ unsafe fn store_screen_position(
 }
 
 unsafe extern "C" fn handle_pre_entry(fighter: &mut SmashlineFighterCommon) -> L2CValue {
-    if overrides::debug_mode() {
-        println!("[smush_info] trace: pre_entry");
-    }
     cancel_result_poll();
     let was_quiesced = HOOKS_QUIESCED.swap(false, Ordering::SeqCst);
     if was_quiesced {
@@ -465,9 +430,6 @@ unsafe extern "C" fn handle_pre_entry(fighter: &mut SmashlineFighterCommon) -> L
 }
 
 unsafe extern "C" fn handle_pre_rebirth(fighter: &mut SmashlineFighterCommon) -> L2CValue {
-    if overrides::debug_mode() {
-        println!("[smush_info] trace: pre_rebirth quiesced {}", hooks_quiesced());
-    }
     if !hooks_quiesced() {
         // Respawn means that stock loss was not the end of the match.
         cancel_result_poll();
@@ -478,9 +440,6 @@ unsafe extern "C" fn handle_pre_rebirth(fighter: &mut SmashlineFighterCommon) ->
 }
 
 unsafe extern "C" fn handle_pre_dead(fighter: &mut SmashlineFighterCommon) -> L2CValue {
-    if overrides::debug_mode() {
-        println!("[smush_info] trace: pre_dead quiesced {}", hooks_quiesced());
-    }
     if !hooks_quiesced() {
         // The KO replay camera faults if stocks are read from this status.
         // Final stocks are read once the results screen is up.
@@ -516,11 +475,6 @@ fn quiesce_fighter_hooks() {
 /// Called from the delayed Main poll, only after `is_result_mode` is true.
 /// Returns true when the wait is over (results recorded, or sudden death discarded).
 unsafe fn read_results_if_ready() -> bool {
-    if !in_gameplay_menu() {
-        // Controls and Mii Maker reach result mode with fighters entered.
-        // Nothing to record, and retrying would keep the poll armed.
-        return true;
-    }
     if FIGHTER_MANAGER_ADDR == 0 {
         return false;
     }
@@ -561,18 +515,12 @@ unsafe fn read_results_if_ready() -> bool {
     // before the dump thread encodes the frozen summary.
     match_feed::sync_stocks(&GAME_INFO);
     arm_stock_result();
-    if overrides::debug_mode() {
-        println!("[smush_info] trace: results read, {} entries", count);
-    }
     true
 }
 
 /// Versus eligibility is latched once both fighters have entered. The per-frame
 /// sampler is not installed; this only marks the match so the death hook can write.
 fn latch_versus_on_entry() {
-    if !in_gameplay_menu() {
-        return;
-    }
     let training = unsafe { app::smashball::is_training_mode() };
     if training {
         return;
@@ -630,7 +578,6 @@ fn arm_stock_result() {
         if (latched || cooldown_ok) && !state.pending_dump {
             state.pending_dump = true;
             state.pending_openings = latched;
-            state.export_replay = !in_vault_menu();
         }
         state.prev_game_over = true;
     }
@@ -833,10 +780,9 @@ fn encode_game_info_snapshot(include_openings: bool) -> Option<Vec<u8>> {
 }
 
 #[inline(never)]
-fn dump_game_info_snapshot(include_openings: bool, export_replay: bool) -> bool {
+fn dump_game_info_snapshot(include_openings: bool) -> bool {
     let log = overrides::results_log();
-    // Playback must not pair or delete a vault file. The results log still writes.
-    let replay = overrides::replay_save() && export_replay;
+    let replay = overrides::replay_save();
     if !log && !replay {
         return true;
     }
@@ -878,8 +824,6 @@ struct MatchTickState {
     stats_dumped: bool,
     pending_dump: bool,
     pending_openings: bool,
-    /// Pair the results log with a vault export. Off for replay playback.
-    export_replay: bool,
     /// Previous match ended while a dump was still encoding. The next tick resets.
     pending_reopen: bool,
 }
@@ -897,7 +841,6 @@ impl MatchTickState {
             stats_dumped: false,
             pending_dump: false,
             pending_openings: false,
-            export_replay: true,
             pending_reopen: false,
         }
     }
@@ -939,7 +882,7 @@ fn request_large_stack_flush() {
 
 #[inline(never)]
 fn flush_match_snapshot() {
-    let (pending, include_openings, export_replay) = {
+    let (pending, include_openings) = {
         let state = match MATCH_TICK.lock() {
             Ok(s) => s,
             Err(poisoned) => poisoned.into_inner(),
@@ -947,14 +890,14 @@ fn flush_match_snapshot() {
         if !state.pending_dump {
             return;
         }
-        (true, state.pending_openings, state.export_replay)
+        (true, state.pending_openings)
     };
     if !pending {
         return;
     }
     // Do not hold MATCH_TICK across serde / SD write.
-    let dump: fn(bool, bool) -> bool = dump_game_info_snapshot;
-    let ok = std::hint::black_box(dump)(include_openings, export_replay);
+    let dump: fn(bool) -> bool = dump_game_info_snapshot;
+    let ok = std::hint::black_box(dump)(include_openings);
     let mut state = match MATCH_TICK.lock() {
         Ok(s) => s,
         Err(poisoned) => poisoned.into_inner(),
@@ -1017,50 +960,6 @@ fn tick_match_state(on_game_thread: bool) {
     request_large_stack_flush();
 }
 
-/// Crash triage for the Eden replay runs. Logs only on change, so the game
-/// thread never pays for a steady state.
-static TRACE_MENU: AtomicU64 = AtomicU64::new(u64::MAX);
-static TRACE_PHASE: AtomicU64 = AtomicU64::new(u64::MAX);
-
-fn trace_menu(menu: u32) {
-    if !overrides::debug_mode() {
-        return;
-    }
-    let prev = TRACE_MENU.swap(menu as u64, Ordering::SeqCst);
-    if prev != menu as u64 {
-        println!("[smush_info] trace: menu {:#x} -> {:#x}", prev, menu);
-    }
-}
-
-fn trace_phase(
-    entry_count: i32,
-    is_match: bool,
-    is_results: bool,
-    remaining: u32,
-    game_over: bool,
-    match_finished: bool,
-    pending_dump: bool,
-) {
-    if !overrides::debug_mode() {
-        return;
-    }
-    let key = (entry_count as u64 & 0xff)
-        | (is_match as u64) << 8
-        | (is_results as u64) << 9
-        | (game_over as u64) << 10
-        | (match_finished as u64) << 11
-        | (pending_dump as u64) << 12
-        | ((remaining == 0) as u64) << 13
-        | ((remaining == u32::MAX) as u64) << 14;
-    if TRACE_PHASE.swap(key, Ordering::SeqCst) == key {
-        return;
-    }
-    println!(
-        "[smush_info] trace: entries {} match {} results {} remaining {} over {} finished {} dump {}",
-        entry_count, is_match, is_results, remaining as i32, game_over, match_finished, pending_dump
-    );
-}
-
 #[inline(never)]
 unsafe fn update_match_state(state: &mut MatchTickState, on_game_thread: bool) {
     reopen_match_state_if_idle(state);
@@ -1073,7 +972,9 @@ unsafe fn update_match_state(state: &mut MatchTickState, on_game_thread: bool) {
         *(FIGHTER_MANAGER_ADDR as *mut *mut app::FighterManager)
     };
     let current_menu: u32 = *(offset_to_addr(MENU_OFFSET) as *const u32);
-    let menu_is_gameplay = menu_word_is_gameplay(current_menu);
+    const CONTROLS_SCREEN_MENU: u32 = 0x6020000; //is_match is set to true when the player in the controls screen, i assume because there is a sandbag and mario. this ensures we're not in the controls screen
+    const MII_MAKER_MENU: u32 = 0x4050000; //performs same check to make sure we're not on mii maker
+    let menu_is_gameplay = current_menu != CONTROLS_SCREEN_MENU && current_menu != MII_MAKER_MENU;
     let is_results = !mgr.is_null()
         && FighterManager::entry_count(mgr) > 0
         && menu_is_gameplay
@@ -1165,7 +1066,6 @@ unsafe fn update_match_state(state: &mut MatchTickState, on_game_thread: bool) {
         if !state.pending_dump {
             state.pending_dump = true;
             state.pending_openings = state.stats_latched;
-            state.export_replay = !menu_word_is_vault(current_menu);
             match_feed::set_sampling(false);
         }
     }
@@ -1195,17 +1095,6 @@ unsafe fn update_match_state(state: &mut MatchTickState, on_game_thread: bool) {
     if match_finished {
         HOOKS_QUIESCED.store(true, Ordering::SeqCst);
     }
-
-    trace_menu(current_menu);
-    trace_phase(
-        entry_count,
-        is_match,
-        is_results,
-        GAME_INFO.remaining_frames.load(Ordering::SeqCst),
-        game_over,
-        match_finished,
-        state.pending_dump,
-    );
 }
 
 #[allow(unreachable_code)]
@@ -1531,6 +1420,7 @@ pub unsafe fn set_player_information(module_accessor: &mut app::BattleObjectModu
     GAME_INFO.players[player_num].is_cpu.store(is_cpu, Ordering::SeqCst);
     GAME_INFO.players[player_num].skin.store(skin, Ordering::SeqCst);
     GAME_INFO.players[player_num].team.store(team, Ordering::SeqCst);
+    println!("ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ player tag {}", get_tag_of_player(player_num));
     GAME_INFO.players[player_num].name.store_str(Some(&get_tag_of_player(player_num)), Ordering::SeqCst);
 }
 
