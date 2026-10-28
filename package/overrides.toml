@@ -8,4 +8,5 @@ disable_list = [
     # "disable_results_log",
     # "disable_replay_save",
     # "disable_results_skip",
+    # "disable_stats",
 ]

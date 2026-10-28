@@ -1,7 +1,8 @@
 use crate::results_log;
 use smush_info_shared::hid_route::PadKind;
 use smush_info_shared::{
-    pause_deadline, save_wait_result, should_arm_save, skip_phase_done, SaveWait,
+    abandon_save_for_menu, pause_deadline, save_wait_result, should_arm_save, skip_phase_done,
+    SaveWait,
 };
 use skyline::hooks::A64HookFunction;
 use skyline::libc::{c_char, c_void};
@@ -812,8 +813,22 @@ fn hid_mask_buttons(kind: PadKind) -> HidAction {
     if !crate::overrides::hid_enabled() {
         return HidAction::Pass;
     }
+    let save_menu = unsafe { !crate::vault_playback() };
     let live = unsafe { live_is_results() };
     let mut st = lock_state();
+    // Playback keeps result mode. Leaving the session armed pumps the task
+    // against an archive that is not loaded (01793156795).
+    if abandon_save_for_menu(st.wants_hid_mask(), save_menu) {
+        let now = Instant::now();
+        st.save_armed = false;
+        st.direct_pending = false;
+        st.hid_released = true;
+        st.set_phase(HidPhase::Done, now);
+        st.hid_session = false;
+        st.last_hid_poll = None;
+        hid_store_elapsed(0);
+        return HidAction::Pass;
+    }
     if live {
         st.logged_live_drop = false;
         st.begin_hid_session();

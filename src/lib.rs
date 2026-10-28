@@ -18,7 +18,8 @@ use smash::Vector3f;
 
 use smush_info_shared::{
     clear_results_session, handshake_response, menu_is_gameplay, new_match_resets_save,
-    replay_save_on_menu, should_arm_clock_zero, should_submit, should_write_stats_snapshot,
+    should_arm_clock_zero, should_pump_replay, should_write_stats_snapshot,
+    still_in_playback,
     text_frame, Character, Info,
 };
 use lazy_static::lazy_static;
@@ -289,11 +290,18 @@ fn cancel_result_poll() {
     RESULT_POLL_NOT_BEFORE.store(0, Ordering::SeqCst);
 }
 
-/// Vault replay playback. The menu word stays in the `0x05xxxxxx` range,
-/// including `0x5010100` while a saved replay is playing.
+/// Set while the current viewing started in Vault. The winner card rewrites
+/// the menu to the versus id, so the menu word alone looks like a live match.
+static PLAYBACK_SESSION: AtomicBool = AtomicBool::new(false);
+
+/// Vault replay playback, including the winner card after the menu word
+/// changes from `0x5010100` to `0x2010000`.
 pub(crate) unsafe fn vault_playback() -> bool {
     let menu: u32 = *(offset_to_addr(MENU_OFFSET) as *const u32);
-    !replay_save_on_menu(menu)
+    let was = PLAYBACK_SESSION.load(Ordering::SeqCst);
+    let now = still_in_playback(was, menu);
+    PLAYBACK_SESSION.store(now, Ordering::SeqCst);
+    now
 }
 
 /// Vault playback on Eden skips the match update. Consoles still publish it.
@@ -396,7 +404,13 @@ unsafe fn sample_live_fighter(fighter: &mut SmashlineFighterCommon) {
     if StatusModule::status_kind(module_accessor) == *FIGHTER_STATUS_KIND_DEAD {
         return;
     }
-    store_screen_position(module_accessor, entry_id as usize);
+    // The replay camera faults if this runs on the killing blow. The other
+    // fighter still reaches it before the death hook can pause sampling, so
+    // Vault playback on the emulator skips it for the whole match.
+    if !emulator_vault_inert() {
+        store_screen_position(module_accessor, entry_id as usize);
+    }
+    remember_emu_entry(fighter.battle_object as u64, entry_id);
     match_feed::capture(module_accessor, entry_id as usize);
 }
 
@@ -455,11 +469,9 @@ unsafe extern "C" fn handle_pre_rebirth(fighter: &mut SmashlineFighterCommon) ->
 
 unsafe extern "C" fn handle_pre_dead(fighter: &mut SmashlineFighterCommon) -> L2CValue {
     if !hooks_quiesced() {
-        // The KO replay camera faults if stocks are read from this status.
-        // Final stocks are read once the results screen is up.
-        // On the emulator that later read is skipped. Count the loss here.
-        let module_accessor = app::sv_system::battle_object_module_accessor(fighter.lua_state_agent);
-        emulator_note_stock_loss(module_accessor);
+        // The KO replay camera faults if this status calls into the fighter.
+        // The entry id was stored while sampling. Count the loss from that.
+        emulator_note_stock_loss(fighter);
         schedule_result_poll();
     }
     original_status(Pre, fighter, *FIGHTER_STATUS_KIND_DEAD)(fighter)
@@ -485,32 +497,56 @@ static HOOKS_QUIESCED: AtomicBool = AtomicBool::new(false);
 /// instead of asking the game who is still alive.
 static EMU_STOCK_ELIMINATED: AtomicBool = AtomicBool::new(false);
 
+/// Battle object pointer seen for each entry while sampling. The death hook
+/// looks this up and does not call the game.
+static EMU_OBJECT_FOR_ENTRY: [AtomicU64; 8] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+
+fn remember_emu_entry(object: u64, entry_id: i32) {
+    if !overrides::emulator_mode() || object == 0 || entry_id < 0 || entry_id > 7 {
+        return;
+    }
+    EMU_OBJECT_FOR_ENTRY[entry_id as usize].store(object, Ordering::SeqCst);
+}
+
+fn emu_entry_for_object(object: u64) -> Option<usize> {
+    if object == 0 {
+        return None;
+    }
+    EMU_OBJECT_FOR_ENTRY
+        .iter()
+        .position(|slot| slot.load(Ordering::SeqCst) == object)
+}
+
 /// One stock lost, from the count stored at entry or the last respawn.
 /// A final-stock self-destruct is not marked, so it counts as a stock taken.
-fn emulator_note_stock_loss(module_accessor: *mut app::BattleObjectModuleAccessor) {
+fn emulator_note_stock_loss(fighter: &SmashlineFighterCommon) {
     if !overrides::emulator_mode() {
         return;
     }
     if GAME_INFO.remaining_frames.load(Ordering::SeqCst) == 0 {
         return;
     }
-    unsafe {
-        let entry_id =
-            WorkModule::get_int(module_accessor, *FIGHTER_INSTANCE_WORK_ID_INT_ENTRY_ID) as i32;
-        if entry_id < 0 {
-            return;
-        }
-        let entry = entry_id as usize;
-        if entry >= GAME_INFO.players.len() {
-            return;
-        }
-        let stocks = &GAME_INFO.players[entry].stocks;
-        let prev = stocks.load(Ordering::SeqCst);
-        let next = prev.saturating_sub(1);
-        stocks.store(next, Ordering::SeqCst);
-        if prev > 0 && next == 0 {
-            EMU_STOCK_ELIMINATED.store(true, Ordering::SeqCst);
-        }
+    let Some(entry) = emu_entry_for_object(fighter.battle_object as u64) else {
+        return;
+    };
+    if entry >= GAME_INFO.players.len() {
+        return;
+    }
+    let stocks = &GAME_INFO.players[entry].stocks;
+    let prev = stocks.load(Ordering::SeqCst);
+    let next = prev.saturating_sub(1);
+    stocks.store(next, Ordering::SeqCst);
+    if prev > 0 && next == 0 {
+        EMU_STOCK_ELIMINATED.store(true, Ordering::SeqCst);
     }
 }
 
@@ -831,7 +867,7 @@ fn encode_game_info_snapshot(include_openings: bool) -> Option<Vec<u8>> {
                     "game_version".to_string(),
                     serde_json::Value::String(game_version()),
                 );
-                if include_openings {
+                if include_openings && overrides::stats() {
                     object.insert("openings".to_string(), match_feed::openings_json());
                 }
             }
@@ -1038,7 +1074,14 @@ fn tick_match_state(on_game_thread: bool) {
         // Pumping continues for the whole dump wait. The task waits on the
         // worker between calls, so once a frame is enough.
         replay_dump::take_direct_save();
-        should_submit(replay_submit_offset(), replay_dump::direct_wait_active())
+        // Vault playback leaves the wait armed. The task then null-derefs in
+        // the unloaded archive (01793156795, text 0x175a0f4).
+        let save_menu = unsafe { !vault_playback() };
+        should_pump_replay(
+            replay_submit_offset(),
+            replay_dump::direct_wait_active(),
+            save_menu,
+        )
     };
     if pump {
         unsafe { pump_replay_save() };
@@ -1175,7 +1218,9 @@ unsafe fn update_match_state(state: &mut MatchTickState, on_game_thread: bool) {
     GAME_INFO.current_menu.store(current_menu, Ordering::SeqCst);
     // Playback looks like results. Arming the save there pumps state 3 against
     // an archive that is not loaded (crash 01793156795, menu 0x5010100).
-    replay_dump::set_results(is_results && replay_save_on_menu(current_menu));
+    // The playback winner card uses the versus menu id. The session, not the
+    // raw word, is what keeps the save from arming there (01793207547).
+    replay_dump::set_results(is_results && !vault_playback());
     if !mgr.is_null() && FighterManager::entry_count(mgr) > 0 && menu_is_gameplay {
         GAME_INFO.is_results_screen.store(FighterManager::is_result_mode(mgr), Ordering::SeqCst);
     }
@@ -1948,7 +1993,10 @@ pub fn main() {
     overrides::load();
     // The sheet is parsed on the first real lookup. Do that here, on the load
     // thread, so the first hit of a session does not stall the game thread.
-    smush_info_shared::preload_move_names();
+    // Opener names are the only caller, so a stats-off boot skips the sheet.
+    if overrides::stats() {
+        smush_info_shared::preload_move_names();
+    }
     unsafe {
         skyline::nn::ro::LookupSymbol(
             &raw mut FIGHTER_MANAGER_ADDR,

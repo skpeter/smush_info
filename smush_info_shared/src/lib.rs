@@ -32,8 +32,8 @@ pub mod hid_route;
 
 mod menu;
 pub use menu::{
-    menu_is_gameplay, menu_is_vault, replay_save_on_menu, CONTROLS_SCREEN_MENU, MII_MAKER_MENU,
-    VAULT_MENU,
+    menu_is_gameplay, menu_is_vault, replay_save_on_menu, still_in_playback, CONTROLS_SCREEN_MENU,
+    MII_MAKER_MENU, VAULT_MENU, VERSUS_RESULTS_MENU,
 };
 
 mod emulator_mode;
@@ -42,7 +42,8 @@ pub use emulator_mode::{parse_emulator_mode, resolve_emulator_mode, EmulatorMode
 mod replay_save;
 pub use replay_save::{
     clear_results_session, new_match_resets_save, pause_deadline, save_wait_result,
-    should_arm_save, should_submit, skip_phase_done, SaveWait, PAUSE_GAP_MS, SKIP_PULSE_MS,
+    abandon_save_for_menu, should_arm_save, should_pump_replay, should_submit, skip_phase_done,
+    SaveWait, PAUSE_GAP_MS, SKIP_PULSE_MS,
 };
 
 #[derive(Serialize, Deserialize, Debug)]

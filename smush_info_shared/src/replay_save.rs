@@ -65,6 +65,19 @@ pub fn should_submit(offset: usize, pending: bool) -> bool {
     offset != 0 && pending
 }
 
+/// The dump wait only calls the replay task on a menu that just played a match.
+/// Vault playback keeps the results flag and the task then faults: the playback
+/// archive is not loaded (crash 01793156795, `ldp` at text `0x175a0f4`).
+pub fn should_pump_replay(offset: usize, pending: bool, save_menu: bool) -> bool {
+    should_submit(offset, pending) && save_menu
+}
+
+/// An armed pad session stays up through the results Yes dialog. Vault is a
+/// different menu: drop that session instead of pumping or masking there.
+pub fn abandon_save_for_menu(session_active: bool, save_menu: bool) -> bool {
+    session_active && !save_menu
+}
+
 /// The Yes dialog clears `is_result_mode` for one poll while fighters stay
 /// entered. The session ends only when both flags are false.
 pub fn clear_results_session(is_match: bool, is_results: bool) -> bool {
@@ -179,5 +192,21 @@ mod tests {
         assert!(!should_submit(0, true));
         assert!(should_submit(0x143d5d0, true));
         assert!(!should_submit(0x143d5d0, false));
+    }
+
+    #[test]
+    fn vault_menu_does_not_pump_an_armed_wait() {
+        // Crash 01793156795: dump wait was still active on menu 0x5010100.
+        assert!(!should_pump_replay(0x143ea40, true, false));
+        assert!(should_pump_replay(0x143ea40, true, true));
+        assert!(!should_pump_replay(0, true, true));
+        assert!(!should_pump_replay(0x143ea40, false, true));
+    }
+
+    #[test]
+    fn vault_menu_abandons_an_armed_pad_session() {
+        assert!(abandon_save_for_menu(true, false));
+        assert!(!abandon_save_for_menu(true, true));
+        assert!(!abandon_save_for_menu(false, false));
     }
 }

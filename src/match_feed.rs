@@ -85,6 +85,11 @@ pub unsafe fn capture(
     let suicide_count = player.self_destructs.load(Ordering::SeqCst);
     let damage = DamageModule::damage(module_accessor, 0);
     player.damage.store(damage, Ordering::SeqCst);
+    // Current percent is match state. The calculator, opener names, and the
+    // openings list stay off when `disable_stats` is set.
+    if !crate::overrides::stats() {
+        return false;
+    }
     let hitstun = WorkModule::get_float(
         module_accessor,
         *FIGHTER_INSTANCE_WORK_ID_FLOAT_DAMAGE_REACTION_FRAME,
@@ -114,6 +119,9 @@ pub unsafe fn capture(
 /// Copy results-screen stocks into the calculator and publish. The KO camera
 /// frame never reads `FighterInformation`; this runs only after result mode.
 pub fn sync_stocks(info: &Info) {
+    if !crate::overrides::stats() {
+        return;
+    }
     let Some(pair) = active_pair(info) else {
         return;
     };
