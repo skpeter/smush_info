@@ -17,6 +17,12 @@ pub fn menu_is_vault(menu: u32) -> bool {
     (menu & TOP_LEVEL_MENU_MASK) == VAULT_MENU
 }
 
+/// A match you just played can save. Vault playback raises the same results
+/// flag, and the save pump then faults on an archive that is not loaded.
+pub fn replay_save_on_menu(menu: u32) -> bool {
+    !menu_is_vault(menu)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -32,6 +38,15 @@ mod tests {
         for menu in [0, 0x1000000, 0x2010000, 0x4050000, 0x6020000, 0x50000, 0x15000000] {
             assert!(!menu_is_vault(menu), "{:#x}", menu);
         }
+    }
+
+    #[test]
+    fn vault_playback_does_not_save() {
+        // Crash 01793156795: results during playback, menu 0x5010100.
+        assert!(!replay_save_on_menu(0x5010100));
+        assert!(!replay_save_on_menu(VAULT_MENU));
+        // The versus results that saved on console the same day.
+        assert!(replay_save_on_menu(0x2010000));
     }
 
     #[test]

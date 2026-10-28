@@ -788,7 +788,9 @@ fn install_npad_abs_hooks() {
 }
 
 unsafe fn live_is_results() -> bool {
-    if crate::emulator_vault_inert() {
+    // The pad hook starts the save on its own. Vault must miss it on console
+    // too, or the 7.5s mute still pumps the replay task.
+    if crate::vault_playback() {
         return false;
     }
     if crate::FIGHTER_MANAGER_ADDR == 0 {

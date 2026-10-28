@@ -17,8 +17,8 @@ use smash::Vector2f;
 use smash::Vector3f;
 
 use smush_info_shared::{
-    clear_results_session, handshake_response, menu_is_gameplay, menu_is_vault,
-    new_match_resets_save, should_arm_clock_zero, should_submit, should_write_stats_snapshot,
+    clear_results_session, handshake_response, menu_is_gameplay, new_match_resets_save,
+    replay_save_on_menu, should_arm_clock_zero, should_submit, should_write_stats_snapshot,
     text_frame, Character, Info,
 };
 use lazy_static::lazy_static;
@@ -289,13 +289,16 @@ fn cancel_result_poll() {
     RESULT_POLL_NOT_BEFORE.store(0, Ordering::SeqCst);
 }
 
-/// Vault playback on Eden. Consoles resolve `emulator_mode` off and never read the menu here.
-pub(crate) unsafe fn emulator_vault_inert() -> bool {
-    if !overrides::emulator_mode() {
-        return false;
-    }
+/// Vault replay playback. The menu word stays in the `0x05xxxxxx` range,
+/// including `0x5010100` while a saved replay is playing.
+pub(crate) unsafe fn vault_playback() -> bool {
     let menu: u32 = *(offset_to_addr(MENU_OFFSET) as *const u32);
-    menu_is_vault(menu)
+    !replay_save_on_menu(menu)
+}
+
+/// Vault playback on Eden skips the match update. Consoles still publish it.
+pub(crate) unsafe fn emulator_vault_inert() -> bool {
+    overrides::emulator_mode() && vault_playback()
 }
 
 /// Live socket flags. The TCP thread must not call `FighterManager` (that races
@@ -1170,7 +1173,9 @@ unsafe fn update_match_state(state: &mut MatchTickState, on_game_thread: bool) {
     }
 
     GAME_INFO.current_menu.store(current_menu, Ordering::SeqCst);
-    replay_dump::set_results(is_results);
+    // Playback looks like results. Arming the save there pumps state 3 against
+    // an archive that is not loaded (crash 01793156795, menu 0x5010100).
+    replay_dump::set_results(is_results && replay_save_on_menu(current_menu));
     if !mgr.is_null() && FighterManager::entry_count(mgr) > 0 && menu_is_gameplay {
         GAME_INFO.is_results_screen.store(FighterManager::is_result_mode(mgr), Ordering::SeqCst);
     }

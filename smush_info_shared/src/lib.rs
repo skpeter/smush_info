@@ -31,7 +31,10 @@ pub use ws::{handshake_response, text_frame};
 pub mod hid_route;
 
 mod menu;
-pub use menu::{menu_is_gameplay, menu_is_vault, CONTROLS_SCREEN_MENU, MII_MAKER_MENU, VAULT_MENU};
+pub use menu::{
+    menu_is_gameplay, menu_is_vault, replay_save_on_menu, CONTROLS_SCREEN_MENU, MII_MAKER_MENU,
+    VAULT_MENU,
+};
 
 mod emulator_mode;
 pub use emulator_mode::{parse_emulator_mode, resolve_emulator_mode, EmulatorMode};
