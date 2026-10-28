@@ -386,8 +386,7 @@ unsafe fn sample_live_fighter(fighter: &mut SmashlineFighterCommon) {
     }
     latch_versus_on_entry();
     let module_accessor = fighter.module_accessor;
-    let entry_id =
-        WorkModule::get_int(module_accessor, *FIGHTER_INSTANCE_WORK_ID_INT_ENTRY_ID) as i32;
+    let entry_id = WorkModule::get_int(module_accessor, *FIGHTER_INSTANCE_WORK_ID_INT_ENTRY_ID) as i32;
     if entry_id < 0 {
         return;
     }
@@ -423,6 +422,7 @@ unsafe fn store_screen_position(
 
 unsafe extern "C" fn handle_pre_entry(fighter: &mut SmashlineFighterCommon) -> L2CValue {
     cancel_result_poll();
+    EMU_STOCK_ELIMINATED.store(false, Ordering::SeqCst);
     let was_quiesced = HOOKS_QUIESCED.swap(false, Ordering::SeqCst);
     if was_quiesced {
         for player in &GAME_INFO.players {
@@ -443,6 +443,7 @@ unsafe extern "C" fn handle_pre_rebirth(fighter: &mut SmashlineFighterCommon) ->
     if !hooks_quiesced() {
         // Respawn means that stock loss was not the end of the match.
         cancel_result_poll();
+        EMU_STOCK_ELIMINATED.store(false, Ordering::SeqCst);
         let module_accessor = app::sv_system::battle_object_module_accessor(fighter.lua_state_agent);
         set_player_information(module_accessor);
     }
@@ -453,6 +454,9 @@ unsafe extern "C" fn handle_pre_dead(fighter: &mut SmashlineFighterCommon) -> L2
     if !hooks_quiesced() {
         // The KO replay camera faults if stocks are read from this status.
         // Final stocks are read once the results screen is up.
+        // On the emulator that later read is skipped. Count the loss here.
+        let module_accessor = app::sv_system::battle_object_module_accessor(fighter.lua_state_agent);
+        emulator_note_stock_loss(module_accessor);
         schedule_result_poll();
     }
     original_status(Pre, fighter, *FIGHTER_STATUS_KIND_DEAD)(fighter)
@@ -473,6 +477,60 @@ pub(crate) static GAME_INFO: Info = Info::new();
 /// While set, rebirth and death do not touch fighter modules.
 static HOOKS_QUIESCED: AtomicBool = AtomicBool::new(false);
 
+/// Emulator only. A death brought this fighter's tracked stocks to 0.
+/// Cleared on respawn and on the next entry. The results poll uses it
+/// instead of asking the game who is still alive.
+static EMU_STOCK_ELIMINATED: AtomicBool = AtomicBool::new(false);
+
+/// One stock lost, from the count stored at entry or the last respawn.
+/// A final-stock self-destruct is not marked, so it counts as a stock taken.
+fn emulator_note_stock_loss(module_accessor: *mut app::BattleObjectModuleAccessor) {
+    if !overrides::emulator_mode() {
+        return;
+    }
+    if GAME_INFO.remaining_frames.load(Ordering::SeqCst) == 0 {
+        return;
+    }
+    unsafe {
+        let entry_id =
+            WorkModule::get_int(module_accessor, *FIGHTER_INSTANCE_WORK_ID_INT_ENTRY_ID) as i32;
+        if entry_id < 0 {
+            return;
+        }
+        let entry = entry_id as usize;
+        if entry >= GAME_INFO.players.len() {
+            return;
+        }
+        let stocks = &GAME_INFO.players[entry].stocks;
+        let prev = stocks.load(Ordering::SeqCst);
+        let next = prev.saturating_sub(1);
+        stocks.store(next, Ordering::SeqCst);
+        if prev > 0 && next == 0 {
+            EMU_STOCK_ELIMINATED.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
+/// Results bookkeeping without `FighterInformation`. A non-final death keeps
+/// waiting so respawn can restore the official count. Clock 0 leaves stocks
+/// as they were, same as the console path.
+fn emulator_finish_results() -> bool {
+    if GAME_INFO.remaining_frames.load(Ordering::SeqCst) == 0 {
+        EMU_STOCK_ELIMINATED.store(false, Ordering::SeqCst);
+        quiesce_fighter_hooks();
+        arm_clock_zero();
+        return true;
+    }
+    if !EMU_STOCK_ELIMINATED.load(Ordering::SeqCst) {
+        return false;
+    }
+    EMU_STOCK_ELIMINATED.store(false, Ordering::SeqCst);
+    GAME_INFO.is_results_screen.store(true, Ordering::SeqCst);
+    match_feed::sync_stocks(&GAME_INFO);
+    arm_stock_result();
+    true
+}
+
 fn hooks_quiesced() -> bool {
     HOOKS_QUIESCED.load(Ordering::SeqCst)
 }
@@ -485,6 +543,9 @@ fn quiesce_fighter_hooks() {
 /// Called from the delayed Main poll, only after `is_result_mode` is true.
 /// Returns true when the wait is over (results recorded, or sudden death discarded).
 unsafe fn read_results_if_ready() -> bool {
+    if overrides::emulator_mode() {
+        return emulator_finish_results();
+    }
     if FIGHTER_MANAGER_ADDR == 0 {
         return false;
     }

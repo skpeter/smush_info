@@ -92,35 +92,6 @@ fn log_path(stem: &str) -> PathBuf {
     match_dir(stem).join(format!("{}.log", stem))
 }
 
-fn patch_replay_file(stem: &str, replay_file: &str) {
-    let path = log_path(stem);
-    let Ok(raw) = fs::read(&path) else {
-        return;
-    };
-    let mut value: serde_json::Value = match serde_json::from_slice(&raw) {
-        Ok(v) => v,
-        Err(_) => return,
-    };
-    let Some(obj) = value.as_object_mut() else {
-        return;
-    };
-    obj.insert(
-        "replay_file".to_string(),
-        serde_json::Value::String(replay_file.to_string()),
-    );
-    match serde_json::to_vec(&value) {
-        Ok(mut data) => {
-            if !data.ends_with(&[b'\n']) {
-                data.push(b'\n');
-            }
-            if let Err(e) = fs::write(&path, data) {
-                println!("[smush_info] failed to patch replay_file {:?}: {}", path, e);
-            }
-        }
-        Err(_) => {}
-    }
-}
-
 fn remove_match(stem: &str) {
     let dir = match_dir(stem);
     if dir.is_dir() {
@@ -208,7 +179,6 @@ pub fn write_replay(stem: &str, vault_path: &str, data: &[u8]) -> bool {
         println!("[smush_info] failed to write replay {:?}: {}", path, e);
         return false;
     }
-    patch_replay_file(stem, &name);
     prune_oldest(stem);
     true
 }

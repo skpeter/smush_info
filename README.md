@@ -12,9 +12,9 @@ Seems jam1garner has left the scene so I don't feel particularly comfortable ask
 
 ## What it does
 
-Connect to the Switch on port **4242**. Each line is one JSON object about the match on screen (see `example.json`). A browser overlay can use that same port.
+Connect to the Switch on port **4242**. Each line is one JSON object about the match on screen. A browser overlay can use that same port.
 
-For a normal versus 1v1 (CPUs are fine; training, free-for-alls, and doubles are not), each player also gets a few running totals: openings, stage control, damage, stocks, and death percents. Those update during the game and freeze on the results screen. Other modes just send zeros.
+For a normal versus 1v1 (CPUs are fine; training, free-for-alls, and doubles are not), each player also gets a few running totals: openings, stage control, damage, stocks, and death percents. Those update during the game and freeze on the results screen. Other modes just send zeros. If you want the field names, [example.json](example.json) is a finished 1v1. The live feed is that object. The results file also includes `game_version` and `openings`, which are in the sample.
 
 If you show these numbers on a stream overlay, credit **Vye** (Vye#0547) and **TheComet** (TheComet#5387).
 
@@ -62,7 +62,7 @@ disable_list = [
 - `disable_results_log` — do not write the results JSON
 - `disable_replay_save` — do not save the replay or copy it to the SD card
 - `disable_results_skip` — leave the results screen up after a save
-- `emulator_mode` — `auto`, `on`, or `off`. `auto` is meant for the Eden emulator: it turns on when `sd:/atmosphere/package3` is missing, and stays off on a real Switch SD. While it is on, live matches still work, Vault playback still sends match data, and replay save stays off.
+- `emulator_mode` — `auto`, `on`, or `off`. `auto` is meant for the Eden emulator: it turns on when `sd:/atmosphere/package3` is missing, and stays off on a real Switch SD. While it is on, live matches still work, Vault playback still sends match data, and replay save stays off. The ending stock count comes from deaths already seen, instead of asking the game again on the results screen. A self-destruct on the last stock can show up as the opponent taking that stock.
 
 # How to Build and Install
 You must have Rust and Cargo installed. [Click here](https://www.rust-lang.org/tools/install) for instructions on how to install based on your system.
