@@ -336,20 +336,26 @@ unsafe fn refresh_reported_match() {
     GAME_INFO.remaining_frames.store(remaining, Ordering::SeqCst);
 }
 
-/// Installed so the results read runs on the game thread. Returns before any
-/// fighter-module read while a death is pending. The KO camera frame only stores
-/// that deadline. While no death is pending, sample this fighter. The socket
-/// flags refresh once per frame inside `tick_match_once_per_frame`.
+/// Live sample only. A pending death keeps this line from reading fighter
+/// modules: the KO camera faults if `FighterInformation` runs on the killing
+/// blow. The stock read that records the winner runs later, on the after-frame
+/// tick, once the results screen is up.
 unsafe extern "C" fn poll_results_after_ko(fighter: &mut SmashlineFighterCommon) {
-    // Replay save and the results file arm from this tick. Once per frame, including
-    // the KO-camera wait. This does not read fighter modules or the camera.
-    tick_match_once_per_frame();
-    let due = RESULT_POLL_NOT_BEFORE.load(Ordering::SeqCst);
-    if due == 0 {
-        sample_live_fighter(fighter);
+    // Match tick, FighterManager, and the clock run after the frame walk.
+    // Calling them from this line left the update with a null link or a null
+    // vtable (01793405989, 01793406769).
+    if RESULT_POLL_NOT_BEFORE.load(Ordering::SeqCst) != 0 {
         return;
     }
-    if due == u64::MAX {
+    sample_live_fighter(fighter);
+}
+
+/// Winner stocks, after the killing blow. `handle_pre_dead` only stores the
+/// deadline. This runs from the after-frame tick, and `read_results_if_ready`
+/// still refuses to touch `FighterInformation` until result mode.
+fn poll_deferred_results() {
+    let due = RESULT_POLL_NOT_BEFORE.load(Ordering::SeqCst);
+    if due == 0 || due == u64::MAX {
         return;
     }
     let now = mono_ms();
@@ -485,7 +491,6 @@ fn install_fighter_status_hooks() {
         .install();
 }
 
-
 pub(crate) static GAME_INFO: Info = Info::new();
 
 /// Set when a stock match is decided or the clock hits 0. Cleared on the next entry.
@@ -579,8 +584,9 @@ fn quiesce_fighter_hooks() {
     match_feed::set_sampling(false);
 }
 
-/// Called from the delayed Main poll, only after `is_result_mode` is true.
+/// Called from the after-frame tick, only after `is_result_mode` is true.
 /// Returns true when the wait is over (results recorded, or sudden death discarded).
+/// The killing-blow frame never reaches here: the death hook only arms the deadline.
 unsafe fn read_results_if_ready() -> bool {
     if overrides::emulator_mode() {
         return emulator_finish_results();
@@ -1024,6 +1030,16 @@ fn flush_match_snapshot() {
 
 static LAST_MATCH_TICK_MS: AtomicU64 = AtomicU64::new(u64::MAX);
 
+/// 13.0.5 main loop, the instruction after `bl 0x3747820`. That call is the
+/// frame walk whose stack contains the fighter iteration. Running the tick
+/// here is on the main thread, after that walk has returned.
+const AFTER_FRAME_TICK_OFFSET: usize = 0x2c5cf0;
+
+#[skyline::hook(offset = AFTER_FRAME_TICK_OFFSET, inline)]
+unsafe fn after_frame_tick(_ctx: &InlineCtx) {
+    tick_match_once_per_frame();
+}
+
 fn tick_match_once_per_frame() {
     let now = mono_ms();
     let prev = LAST_MATCH_TICK_MS.load(Ordering::SeqCst);
@@ -1036,6 +1052,9 @@ fn tick_match_once_per_frame() {
     {
         return;
     }
+    // Stocks first, so the dump below records the winner. Still no
+    // FighterInformation until the deadline and result mode.
+    poll_deferred_results();
     tick_match_state(true);
     // Same values for every fighter in the frame. A pending KO-camera read
     // still skips this, so the results timer is not published during that wait.
@@ -1192,10 +1211,13 @@ unsafe fn update_match_state(state: &mut MatchTickState, on_game_thread: bool) {
     );
     // Replay save uses the results screen even when the stats winner check is quiet.
     // Arm only. The 1MB thread writes the file and pairs the replay.
+    // A death is still waiting to fold stocks in. Writing now would record the
+    // pre-death count. `poll_deferred_results` arms the dump after the read.
     let replay_write = !state.dumped_this_match
         && (is_results || game_over_edge)
         && state.ticks_since_dump >= DUMP_RETRY_TICKS;
-    if stats_write || replay_write {
+    let await_result_stocks = RESULT_POLL_NOT_BEFORE.load(Ordering::SeqCst) != 0;
+    if (stats_write || replay_write) && !await_result_stocks {
         if is_results {
             GAME_INFO.is_results_screen.store(true, Ordering::SeqCst);
         }
@@ -2031,11 +2053,12 @@ pub fn main() {
         special_lw_open_command_hook,
         special_lw_close_window_hook,
         special_lw_decide_command_hook,
-        special_lw_select_index_hook
+        special_lw_select_index_hook,
+        after_frame_tick
     );
     replay_dump::install();
-    // Main samples a live 1v1 and polls for the results screen a few seconds
-    // after a death. It does not read fighter modules on the KO camera frame.
+    // Main samples a live 1v1. The winner stock read waits out the KO camera
+    // and runs from the after-frame tick, once the results screen is up.
     // The same hook arms the replay save. Screen position is updated only on
     // live frames, not on the death status.
     install_results_poll_hook();
