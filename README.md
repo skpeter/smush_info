@@ -20,7 +20,7 @@ If you show these numbers on a stream overlay, credit **Vye** (Vye#0547) and **T
 
 When that 1v1 ends, the same snapshot is written next to the replay, with the list of openings included.
 
-After the results screen comes up, the plugin saves the replay for you, copies it to the SD card, and (unless you turn it off) taps A for a few seconds to leave the results screen. The file keeps the Vault name, under:
+After the results screen comes up, the plugin calls the game's replay save directly (not by pressing buttons through the save prompt) and copies the file to the SD card. You dismiss results yourself. The file keeps the Vault name, under:
 
 ```
 sd:/ultimate/smush_info/replays/{name}/
@@ -28,9 +28,9 @@ sd:/ultimate/smush_info/replays/{name}/
 
 Copy that file into `save_data/replay/` if you want it back in the game, and keep the name. The results JSON sits in the same folder. Once the copy is on the SD card, the Vault copy is deleted so the console save does not fill up.
 
-If the save never shows up, your controllers come back and it does not press A, so you can leave the screen yourself. Going Home pauses the wait. Watching a replay in the Vault does not trigger a save.
+Going Home pauses the wait. Watching a replay in the Vault does not trigger a save.
 
-Do not also install [Auto-Save Replays](https://gamebanana.com/mods/394784) or another results-screen skip. They press buttons on the same screen and get in the way. Keep `libnn_hid_hook.nro` if your other mods need it.
+Do not also install [Auto-Save Replays](https://gamebanana.com/mods/394784). That mod drives the results/save UI with button presses and can fight other plugins. Keep `libnn_hid_hook.nro` if your other mods need it.
 
 # Requirements
 smush_info requires you to have the following Skyline plugins downloaded and installed:
@@ -55,14 +55,12 @@ emulator_mode = "auto"
 disable_list = [
     # "disable_results_log",
     # "disable_replay_save",
-    # "disable_results_skip",
     # "disable_stats",
 ]
 ```
 
 - `disable_results_log` — do not write the results JSON
 - `disable_replay_save` — do not save the replay or copy it to the SD card
-- `disable_results_skip` — leave the results screen up after a save
 - `disable_stats` — leave the versus totals at zero and leave openings out of the results file. Percent, stocks, and screen position keep updating.
 - `emulator_mode` — `auto`, `on`, or `off`. `auto` is meant for the Eden emulator: it turns on when `sd:/atmosphere/package3` is missing, and stays off on a real Switch SD. While it is on, live matches still work, Vault playback still sends match data, and replay save stays off. The ending stock count comes from deaths already seen, instead of asking the game again on the results screen. Screen position is not updated during Vault playback. A self-destruct on the last stock can show up as the opponent taking that stock.
 

@@ -1,18 +1,16 @@
 //! When the results screen arms one direct replay save, and when that wait ends.
 //!
-//! The 7.5s mute clock stays in the plugin. These functions only decide.
+//! Save is the results-menu task pump, not a button path through the Yes
+//! dialog. Results-screen skip (injected A) was removed: it never reliably
+//! reached the menu input path.
 
 /// A pad poll this long, or longer, is a HOME press or a suspend. Shorter
 /// hitches leave the deadline where it is.
 pub const PAUSE_GAP_MS: u128 = 1000;
 
-/// Results leave on a 3 second A pulse. An 8 second pulse walks into the next menu.
-pub const SKIP_PULSE_MS: u128 = 3000;
-
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SaveWait {
     KeepWaiting,
-    Skip,
     Done,
     GiveUp,
 }
@@ -25,21 +23,12 @@ pub fn should_arm_save(results: bool, replay_save: bool, already_armed: bool) ->
 
 /// What the post-submit wait does on this poll.
 ///
-/// A landed SD file wins. An open vault write keeps the wait alive past the
-/// deadline. When the deadline passes with nothing open and no file, give up:
-/// pads come back, and the skip pulse does not run.
-pub fn save_wait_result(
-    file_landed: bool,
-    skip_on: bool,
-    write_open: bool,
-    wait_elapsed: bool,
-) -> SaveWait {
+/// A landed SD file ends the wait. An open vault write keeps the wait alive
+/// past the deadline. When the deadline passes with nothing open and no file,
+/// give up.
+pub fn save_wait_result(file_landed: bool, write_open: bool, wait_elapsed: bool) -> SaveWait {
     if file_landed {
-        return if skip_on {
-            SaveWait::Skip
-        } else {
-            SaveWait::Done
-        };
+        return SaveWait::Done;
     }
     if write_open || !wait_elapsed {
         return SaveWait::KeepWaiting;
@@ -56,10 +45,6 @@ pub fn pause_deadline(deadline_ms: u128, gap_ms: u128) -> u128 {
     }
 }
 
-pub fn skip_phase_done(phase_ms: u128) -> bool {
-    phase_ms >= SKIP_PULSE_MS
-}
-
 /// A zero offset is a missing entry. That does not call.
 pub fn should_submit(offset: usize, pending: bool) -> bool {
     offset != 0 && pending
@@ -72,14 +57,14 @@ pub fn should_pump_replay(offset: usize, pending: bool, save_menu: bool) -> bool
     should_submit(offset, pending) && save_menu
 }
 
-/// An armed pad session stays up through the results Yes dialog. Vault is a
-/// different menu: drop that session instead of pumping or masking there.
+/// Drop an armed save session when leaving versus for Vault (or any non-save
+/// menu). Vault must not keep pumping the results task.
 pub fn abandon_save_for_menu(session_active: bool, save_menu: bool) -> bool {
     session_active && !save_menu
 }
 
-/// The Yes dialog clears `is_result_mode` for one poll while fighters stay
-/// entered. The session ends only when both flags are false.
+/// End the results session only when both match and results are clear.
+/// A brief `is_result_mode` dip must not look like a brand-new match.
 pub fn clear_results_session(is_match: bool, is_results: bool) -> bool {
     !is_match && !is_results
 }
@@ -120,39 +105,26 @@ mod tests {
     }
 
     #[test]
-    fn file_landed_and_skip_on_goes_to_skip() {
-        assert_eq!(
-            save_wait_result(true, true, false, false),
-            SaveWait::Skip
-        );
-    }
-
-    #[test]
-    fn file_landed_and_skip_off_is_done() {
-        assert_eq!(
-            save_wait_result(true, false, true, true),
-            SaveWait::Done
-        );
+    fn file_landed_is_done() {
+        assert_eq!(save_wait_result(true, false, false), SaveWait::Done);
+        assert_eq!(save_wait_result(true, true, true), SaveWait::Done);
     }
 
     #[test]
     fn write_handle_open_keeps_waiting() {
         assert_eq!(
-            save_wait_result(false, true, true, true),
+            save_wait_result(false, true, true),
             SaveWait::KeepWaiting
         );
     }
 
     #[test]
-    fn wait_elapsed_with_nothing_gives_up_without_skipping() {
+    fn wait_elapsed_with_nothing_gives_up() {
         assert_eq!(
-            save_wait_result(false, true, false, false),
+            save_wait_result(false, false, false),
             SaveWait::KeepWaiting
         );
-        assert_eq!(
-            save_wait_result(false, true, false, true),
-            SaveWait::GiveUp
-        );
+        assert_eq!(save_wait_result(false, false, true), SaveWait::GiveUp);
     }
 
     #[test]
@@ -160,14 +132,6 @@ mod tests {
         assert_eq!(pause_deadline(10_000, 999), 10_000);
         assert_eq!(pause_deadline(10_000, PAUSE_GAP_MS), 11_000);
         assert_eq!(pause_deadline(10_000, 2_500), 12_500);
-    }
-
-    #[test]
-    fn skip_phase_ends_at_three_seconds_not_eight() {
-        assert_eq!(SKIP_PULSE_MS, 3_000);
-        assert_ne!(SKIP_PULSE_MS, 8_000);
-        assert!(!skip_phase_done(2_999));
-        assert!(skip_phase_done(3_000));
     }
 
     #[test]

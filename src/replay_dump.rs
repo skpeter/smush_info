@@ -1,8 +1,7 @@
 use crate::results_log;
 use smush_info_shared::hid_route::PadKind;
 use smush_info_shared::{
-    abandon_save_for_menu, pause_deadline, save_wait_result, should_arm_save, skip_phase_done,
-    SaveWait,
+    abandon_save_for_menu, pause_deadline, save_wait_result, should_arm_save, SaveWait,
 };
 use skyline::hooks::A64HookFunction;
 use skyline::libc::{c_char, c_void};
@@ -36,21 +35,20 @@ enum Pair {
     },
 }
 
-// Anim (mute, 7.5s; HOME and focus push the deadline)
-//   save on and DumpState.results and not armed -> one-shot, then DumpWait
-//   save off, skip on -> Skip
+// Save is the results-menu task pump (every ~16ms). HID only latches results
+// and times that pump. Results-screen skip (injected A) was removed.
+//
+// Anim (player keeps the pad; HOME and focus push the deadline)
+//   save on + results + not armed -> DumpWait immediately (direct pump)
 //   otherwise -> Done
-// DumpWait (mute; no taps)
-//   file + skip -> Skip
-//   file, skip off -> Done
-//   vault write still open -> stay
-//   deadline, nothing open, no file -> Done (pads live, no A)
-// Skip (3s A on every pad) -> Done
+// DumpWait (player keeps the pad; pump runs from pad polls)
+//   SD file -> Done
+//   vault write / unpaired / pump still running -> stay
+//   deadline, nothing open, no file -> Done
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum HidPhase {
     Anim,
     DumpWait,
-    Skip,
     Done,
 }
 
@@ -71,6 +69,8 @@ struct DumpState {
     direct_pending: bool,
     logged_live_drop: bool,
     logged_wait_write: bool,
+    /// The SD copy of this match's replay is written.
+    bin_landed: bool,
 }
 
 impl DumpState {
@@ -90,17 +90,31 @@ impl DumpState {
             direct_pending: false,
             logged_live_drop: false,
             logged_wait_write: false,
+            bin_landed: false,
         }
     }
 
     fn dump_ok(&self) -> bool {
-        matches!(
-            self.pair,
+        self.bin_landed
+            || matches!(
+                self.pair,
+                Pair::Pending {
+                    wrote_bin: true,
+                    ..
+                }
+            )
+    }
+
+    /// Vault bytes are in hand but not copied to the SD card yet. Keep the
+    /// dump wait open until that copy finishes (or the deadline gives up).
+    fn has_unpaired_replay(&self) -> bool {
+        match &self.pair {
+            Pair::Orphan { files } => files.iter().any(|f| !f.buf.is_empty()),
             Pair::Pending {
-                wrote_bin: true,
-                ..
-            }
-        )
+                wrote_bin, best_len, ..
+            } => !wrote_bin && *best_len > 0,
+            Pair::Idle => false,
+        }
     }
 
     fn probe_window(&self) -> bool {
@@ -123,14 +137,34 @@ impl DumpState {
         self.direct_pending = false;
         self.logged_live_drop = false;
         self.logged_wait_write = false;
+        self.bin_landed = false;
+    }
+
+    fn finish_dump_wait(&mut self, phase: HidPhase, now: Instant) {
+        if self.hid_phase == HidPhase::DumpWait {
+            unsafe { crate::end_replay_pump() };
+        }
+        self.set_phase(phase, now);
+    }
+
+    /// Player left results (fighters gone). Stop the dump pump session.
+    fn end_session_off_results(&mut self, now: Instant) {
+        if self.hid_phase == HidPhase::DumpWait {
+            unsafe { crate::end_replay_pump() };
+        }
+        self.save_armed = false;
+        self.direct_pending = false;
+        self.hid_released = true;
+        self.hid_session = false;
+        self.set_phase(HidPhase::Done, now);
+        self.last_hid_poll = None;
+        hid_store_elapsed(0);
     }
 
     fn begin_hid_session(&mut self) -> bool {
         // One session per match. `hid_released` only clears on
-        // `on_match_rising`. Without this, one poll with is_result_mode
-        // false (save dialog, player poking the menu after pads went live)
-        // drops `hid_session`, the next live poll starts a fresh session,
-        // and results gets muted for another 7.5s. The 60s cap is per
+        // `on_match_rising`. A one-poll `is_result_mode` dip must not start a
+        // second session and re-delay the direct pump. The 60s cap is per
         // session, so that loop never ends.
         if self.hid_session || self.hid_released {
             return false;
@@ -377,13 +411,18 @@ pub fn on_json_written(stem: String) {
         let ok = emit_bin(&stem, &cap);
         if ok {
             let mut st = lock_state();
+            let mut landed = false;
             if let Pair::Pending {
                 stem: s, wrote_bin, ..
             } = &mut st.pair
             {
                 if s == &stem {
                     *wrote_bin = true;
+                    landed = true;
                 }
+            }
+            if landed {
+                st.bin_landed = true;
             }
         }
     }
@@ -424,10 +463,16 @@ pub fn take_direct_save() -> bool {
 #[inline(never)]
 pub fn set_results(is_results: bool) {
     let mut st = lock_state();
-    if crate::overrides::hid_enabled() && is_results && !st.results {
-        st.begin_hid_session();
+    if is_results {
+        if crate::overrides::hid_enabled() && !st.results {
+            st.begin_hid_session();
+        }
+        st.results = true;
+    } else if !st.wants_hid_mask() {
+        // A one-frame `is_result_mode` dip must not drop the latch while the
+        // direct save or skip is still running.
+        st.results = false;
     }
-    st.results = is_results;
     if st.hid_session {
         if let Some(t) = st.hid_began {
             hid_store_elapsed(Instant::now().saturating_duration_since(t).as_millis());
@@ -469,6 +514,7 @@ fn finish_close(cap: Capture) {
         let ok = emit_bin(&stem, &cap);
         if ok {
             let mut st = lock_state();
+            let mut landed = false;
             if let Pair::Pending {
                 stem: s,
                 wrote_bin,
@@ -477,29 +523,18 @@ fn finish_close(cap: Capture) {
             {
                 if s == &stem {
                     *wrote_bin = true;
+                    landed = true;
                 }
+            }
+            if landed {
+                st.bin_landed = true;
             }
         }
     }
 }
 
-const KEY_A: u64 = 1;
-const KEY_B: u64 = 1 << 1;
-const KEY_X: u64 = 1 << 2;
-const KEY_Y: u64 = 1 << 3;
-const KEY_LEFT: u64 = 1 << 12;
-const KEY_UP: u64 = 1 << 13;
-const KEY_RIGHT: u64 = 1 << 14;
-const KEY_DOWN: u64 = 1 << 15;
-const KEY_LEFT_SL: u64 = 1 << 24;
-const KEY_LEFT_SR: u64 = 1 << 25;
-const KEY_RIGHT_SL: u64 = 1 << 26;
-const KEY_RIGHT_SR: u64 = 1 << 27;
-const HID_ANIM_MS: u128 = 7500;
 const OE_FOCUS_OUT: i32 = 2;
 const OE_FOCUS_BG: i32 = 3;
-const HID_PULSE_MS: u128 = 100;
-const HID_GAP_MS: u128 = 340;
 const HID_DUMP_WAIT_MS: u128 = 6000;
 const HID_SESSION_MAX_MS: u128 = 60_000;
 
@@ -507,72 +542,20 @@ fn hid_phase_name(phase: HidPhase) -> &'static str {
     match phase {
         HidPhase::Anim => "anim",
         HidPhase::DumpWait => "dump_wait",
-        HidPhase::Skip => "skip",
         HidPhase::Done => "done",
     }
 }
 
-fn note_replay_saved(skip: bool) {
-    if skip {
-        println!("[smush_info] hid: replay saved to sd, skipping results");
-    } else {
-        println!("[smush_info] hid: replay saved to sd, results left up");
-    }
-}
-
-/// Skip pulse. A sideways Joy-Con has no face buttons in the usual places,
-/// so the press includes the d-pad / shoulder cluster that sits there.
-fn hid_exit_buttons(kind: PadKind, ms: u128) -> u64 {
-    let cycle = HID_PULSE_MS + HID_GAP_MS;
-    if (ms % cycle) >= HID_PULSE_MS {
-        return 0;
-    }
-    match kind {
-        PadKind::JoyLeft => KEY_A | KEY_LEFT | KEY_RIGHT | KEY_UP | KEY_DOWN | KEY_LEFT_SL | KEY_LEFT_SR,
-        PadKind::JoyRight => KEY_A | KEY_B | KEY_X | KEY_Y | KEY_RIGHT_SL | KEY_RIGHT_SR,
-        _ => KEY_A,
-    }
-}
-
-#[derive(Clone, Copy)]
-struct HidOut {
-    buttons: u64,
-    stick_x: i32,
-}
-
-impl HidOut {
-    const MUTE: Self = Self {
-        buttons: 0,
-        stick_x: 0,
-    };
-
-    fn buttons(buttons: u64) -> Self {
-        Self {
-            buttons,
-            stick_x: 0,
-        }
-    }
-}
-
 enum HidAction {
-    /// Overwrite this poll's state with our own buttons/stick.
-    Mask(HidOut),
     /// Leave the poll alone: the player keeps full control.
     Pass,
     /// Leave the poll alone and end the session.
     Release,
 }
 
-fn hid_buttons_for_pad(phase: HidPhase, phase_ms: u128, kind: PadKind) -> HidAction {
+fn hid_buttons_for_pad(phase: HidPhase) -> HidAction {
     match phase {
-        HidPhase::Anim | HidPhase::DumpWait => HidAction::Mask(HidOut::MUTE),
-        HidPhase::Skip => {
-            if crate::overrides::results_skip() {
-                HidAction::Mask(HidOut::buttons(hid_exit_buttons(kind, phase_ms)))
-            } else {
-                HidAction::Release
-            }
-        }
+        HidPhase::Anim | HidPhase::DumpWait => HidAction::Pass,
         HidPhase::Done => HidAction::Release,
     }
 }
@@ -587,54 +570,33 @@ fn hid_store_elapsed(ms: u128) {
         .store(ms.min(u128::from(u32::MAX)) as u32, Ordering::Relaxed);
 }
 
-unsafe fn mask_npad(state: *mut NpadHandheldState, out: HidOut) {
-    if state.is_null() {
-        return;
-    }
-    (*state).Buttons = out.buttons;
-    (*state).LStickX = out.stick_x;
-    (*state).LStickY = 0;
-    (*state).RStickX = out.stick_x;
-    (*state).RStickY = 0;
-}
-
-fn hid_count(count: i32) -> usize {
-    count.clamp(0, 16) as usize
-}
-
 fn note_npad_hit() {
     hid_info().hid_npad_hits.fetch_add(1, Ordering::Relaxed);
 }
 
-fn apply_mask_npads(state: *mut NpadHandheldState, count: i32, kind: PadKind) {
-    let HidAction::Mask(out) = hid_mask_buttons(kind) else {
-        hid_info().hid_masking.store(false, Ordering::Relaxed);
-        return;
-    };
-    hid_info().hid_masking.store(true, Ordering::Relaxed);
-    let n = hid_count(count);
+fn pump_save_from_pad() {
+    // `after_frame_tick` is the return from the fighter walk. The results
+    // screen does not take that call, so the save task never advances there.
+    // Pad polls still run. The pump's own 16ms gate keeps the results-menu
+    // rate, and only while a dump wait is already armed.
     unsafe {
-        for i in 0..n {
-            mask_npad(state.add(i), out);
+        if crate::vault_playback() || !direct_wait_active() {
+            return;
         }
+        crate::pump_replay_save();
     }
 }
 
-fn apply_mask_gc(state: *mut NpadGcState, count: i32) {
-    let HidAction::Mask(out) = hid_mask_buttons(PadKind::Gc) else {
-        hid_info().hid_masking.store(false, Ordering::Relaxed);
-        return;
-    };
-    hid_info().hid_masking.store(true, Ordering::Relaxed);
-    let n = hid_count(count);
-    unsafe {
-        for i in 0..n {
-            let p = state.add(i);
-            mask_npad(p as *mut NpadHandheldState, out);
-            (*p).LTrigger = 0;
-            (*p).RTrigger = 0;
-        }
-    }
+fn apply_mask_npads(_state: *mut NpadHandheldState, _count: i32, kind: PadKind) {
+    let _ = hid_mask_buttons(kind);
+    hid_info().hid_masking.store(false, Ordering::Relaxed);
+    pump_save_from_pad();
+}
+
+fn apply_mask_gc(_state: *mut NpadGcState, _count: i32) {
+    let _ = hid_mask_buttons(PadKind::Gc);
+    hid_info().hid_masking.store(false, Ordering::Relaxed);
+    pump_save_from_pad();
 }
 
 static ORIG_STATE: [AtomicPtr<()>; 6] = [
@@ -788,20 +750,34 @@ fn install_npad_abs_hooks() {
     println!("[smush_info] hid: {}/12 npad hooks installed", n);
 }
 
+unsafe fn fighter_manager() -> *mut app::FighterManager {
+    if crate::FIGHTER_MANAGER_ADDR == 0 {
+        return std::ptr::null_mut();
+    }
+    let mgr = *(crate::FIGHTER_MANAGER_ADDR as *mut *mut app::FighterManager);
+    if mgr.is_null() {
+        std::ptr::null_mut()
+    } else {
+        mgr
+    }
+}
+
 unsafe fn live_is_results() -> bool {
     // The pad hook starts the save on its own. Vault must miss it on console
-    // too, or the 7.5s mute still pumps the replay task.
+    // too, or the dump wait still pumps the replay task.
     if crate::vault_playback() {
         return false;
     }
-    if crate::FIGHTER_MANAGER_ADDR == 0 {
-        return false;
-    }
-    let mgr = *(crate::FIGHTER_MANAGER_ADDR as *mut *mut app::FighterManager);
+    let mgr = fighter_manager();
     if mgr.is_null() {
         return false;
     }
     FighterManager::entry_count(mgr) > 0 && FighterManager::is_result_mode(mgr)
+}
+
+unsafe fn results_entries_gone() -> bool {
+    let mgr = fighter_manager();
+    mgr.is_null() || FighterManager::entry_count(mgr) == 0
 }
 
 fn game_unfocused() -> bool {
@@ -809,7 +785,7 @@ fn game_unfocused() -> bool {
     s == OE_FOCUS_OUT || s == OE_FOCUS_BG
 }
 
-fn hid_mask_buttons(kind: PadKind) -> HidAction {
+fn hid_mask_buttons(_kind: PadKind) -> HidAction {
     if !crate::overrides::hid_enabled() {
         return HidAction::Pass;
     }
@@ -829,12 +805,22 @@ fn hid_mask_buttons(kind: PadKind) -> HidAction {
         hid_store_elapsed(0);
         return HidAction::Pass;
     }
+    let now = Instant::now();
+    let dump_ok = st.dump_ok();
     if live {
+        // The after-frame tick does not run on the results screen, so
+        // `set_results` never latches this. Pad polls arm the direct pump.
+        st.results = true;
         st.logged_live_drop = false;
         st.begin_hid_session();
     } else if st.wants_hid_mask() {
-        // The save Yes dialog clears is_result_mode. Aborting here drops
-        // the wait and leaves results with no skip.
+        // Fighters gone => left results. A brief is_result_mode dip with
+        // entries still in keeps the dump pump.
+        let entries_gone = unsafe { results_entries_gone() };
+        if entries_gone {
+            st.end_session_off_results(now);
+            return HidAction::Pass;
+        }
         if !st.logged_live_drop {
             st.logged_live_drop = true;
             println!(
@@ -848,14 +834,13 @@ fn hid_mask_buttons(kind: PadKind) -> HidAction {
         hid_store_elapsed(0);
         return HidAction::Pass;
     }
-    let now = Instant::now();
     if game_unfocused() {
         if let (Some(last), Some(phase_t)) = (st.last_hid_poll, st.phase_began) {
             let gap = now.saturating_duration_since(last);
             st.phase_began = Some(phase_t.checked_add(gap).unwrap_or(phase_t));
         }
         st.last_hid_poll = Some(now);
-        return HidAction::Mask(HidOut::MUTE);
+        return HidAction::Pass;
     }
     let _ = st.absorb_suspend_gap(now);
     st.last_hid_poll = Some(now);
@@ -877,27 +862,26 @@ fn hid_mask_buttons(kind: PadKind) -> HidAction {
         st.hid_released = true;
         return HidAction::Release;
     }
-    let mut phase_ms = st
+    let phase_ms = st
         .phase_began
         .map(|t| now.saturating_duration_since(t).as_millis())
         .unwrap_or(0);
-    let skip = crate::overrides::results_skip();
-    let dump_ok = st.dump_ok();
-    if st.hid_phase == HidPhase::Anim && phase_ms >= HID_ANIM_MS {
+    if st.hid_phase == HidPhase::Anim {
         let armed_before = st.save_armed;
         let results = st.results;
         let save_on = crate::overrides::replay_save();
-        if should_arm_save(results, save_on, armed_before) {
+        // Direct task pump: arm as soon as results is latched.
+        let outcome = if should_arm_save(results, save_on, armed_before) {
             st.save_armed = true;
             st.direct_pending = true;
-            println!("[smush_info] hid: replay submit armed");
+            println!("[smush_info] hid: replay task armed");
             st.set_phase(HidPhase::DumpWait, now);
-        } else if !save_on && skip {
-            st.set_phase(HidPhase::Skip, now);
+            "dump_wait"
         } else {
             st.set_phase(HidPhase::Done, now);
-        }
-        phase_ms = 0;
+            "done"
+        };
+        println!("[smush_info] hid: anim done -> {outcome}");
     }
     if st.hid_phase == HidPhase::DumpWait {
         let write_open = !st.captures.is_empty();
@@ -909,35 +893,26 @@ fn hid_mask_buttons(kind: PadKind) -> HidAction {
                 st.captures.len()
             );
         }
-        let decision = save_wait_result(dump_ok, skip, write_open, wait_elapsed);
+        let save_still_running = write_open
+            || st.has_unpaired_replay()
+            || crate::replay_pump_blocking_giveup(HID_DUMP_WAIT_MS as u64);
+        let decision = save_wait_result(dump_ok, save_still_running, wait_elapsed);
         match decision {
             SaveWait::KeepWaiting => {}
-            SaveWait::Skip => {
-                note_replay_saved(true);
-                st.set_phase(HidPhase::Skip, now);
-                phase_ms = 0;
-            }
             SaveWait::Done => {
                 if dump_ok {
-                    note_replay_saved(false);
+                    println!("[smush_info] hid: replay saved to sd");
                 }
-                st.set_phase(HidPhase::Done, now);
-                phase_ms = 0;
+                st.finish_dump_wait(HidPhase::Done, now);
             }
             SaveWait::GiveUp => {
                 println!("[smush_info] hid: no dump after submit, pads live");
-                st.set_phase(HidPhase::Done, now);
-                phase_ms = 0;
+                st.finish_dump_wait(HidPhase::Done, now);
             }
         }
     }
-    if st.hid_phase == HidPhase::Skip && skip_phase_done(phase_ms) {
-        st.set_phase(HidPhase::Done, now);
-        phase_ms = 0;
-    }
 
-    let phase = st.hid_phase;
-    let action = hid_buttons_for_pad(phase, phase_ms, kind);
+    let action = hid_buttons_for_pad(st.hid_phase);
     if matches!(action, HidAction::Release) {
         st.hid_released = true;
     }

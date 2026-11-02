@@ -1139,11 +1139,10 @@ unsafe fn update_match_state(state: &mut MatchTickState, on_game_thread: bool) {
         && !FighterManager::is_result_mode(mgr)
         && menu_is_gameplay;
 
-    // The save Yes dialog clears is_result_mode while fighters stay entered,
-    // so is_match rises in the middle of results. saw_match stays set until
-    // both flags are false, which is when we have actually left. Resetting
-    // on that dip drops the in-flight save and the pending replay pair,
-    // and the next results tick starts a fresh 7.5s mute.
+    // `is_result_mode` can dip while fighters are still entered, so is_match
+    // rises in the middle of results. saw_match stays set until both flags
+    // are false. Resetting on that dip drops the in-flight direct save and
+    // the pending replay pair.
     if new_match_resets_save(is_match, state.prev_is_match, state.saw_match) {
         replay_dump::on_match_rising();
         state.dumped_this_match = false;
@@ -1621,6 +1620,23 @@ static mut PUMP_LIVE: bool = false;
 static mut PUMP_BUSY: bool = false;
 static mut PUMP_TASK: u64 = 0;
 static mut PUMP_NOT_BEFORE: u64 = 0;
+/// `mono_ms` when `task+0x108` first read 1 or 2. 0 while the task is still stepping.
+static mut PUMP_SETTLED_AT: u64 = 0;
+
+/// True while the results task is still stepping, or for `grace_ms` after it
+/// reports done. The vault file often closes in that window. Ending the wait
+/// first gives the pads back, and the skip pulse never starts.
+pub(crate) fn replay_pump_blocking_giveup(grace_ms: u64) -> bool {
+    unsafe {
+        if !PUMP_LIVE {
+            return false;
+        }
+        if PUMP_SETTLED_AT == 0 {
+            return true;
+        }
+        mono_ms().saturating_sub(PUMP_SETTLED_AT) < grace_ms
+    }
+}
 
 pub(crate) fn replay_submit_offset() -> usize {
     unsafe { REPLAY_SUBMIT_OFFSET }
@@ -1725,10 +1741,11 @@ unsafe fn attach_replay_source(task: u64) -> u64 {
 }
 
 /// Drop the in-flight pump so the next dump wait builds a new task.
-unsafe fn end_replay_pump() {
+pub(crate) unsafe fn end_replay_pump() {
     PUMP_LIVE = false;
     PUMP_TASK = 0;
     PUMP_NOT_BEFORE = 0;
+    PUMP_SETTLED_AT = 0;
 }
 
 /// Build the task the way the results menu does, once per dump wait.
@@ -1753,13 +1770,16 @@ unsafe fn start_replay_task() -> bool {
     *((task as *mut u8).add(0xa8) as *mut i32) = 1;
     *((task as *mut u8).add(0x108) as *mut u32) = 0;
     PUMP_TASK = task;
+    PUMP_SETTLED_AT = 0;
     true
 }
 
 /// One pump about every frame. The menu does this until `task+0x108` is 1 or 2.
 /// Submit is a later state; calling it here overwrites the callback state 1 queued.
+/// Also called from the pad hook: the results screen does not return through
+/// `after_frame_tick`, so this is what advances the save there.
 #[inline(never)]
-unsafe fn pump_replay_save() {
+pub(crate) unsafe fn pump_replay_save() {
     if PUMP_BUSY {
         return;
     }
@@ -1778,6 +1798,9 @@ unsafe fn pump_replay_save() {
     let task = PUMP_TASK;
     let status_now = *((task as *const u8).add(0x108) as *const u32);
     if status_now == 1 || status_now == 2 {
+        if PUMP_SETTLED_AT == 0 {
+            PUMP_SETTLED_AT = now;
+        }
         PUMP_NOT_BEFORE = u64::MAX;
         PUMP_BUSY = false;
         return;

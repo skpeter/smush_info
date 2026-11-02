@@ -6,12 +6,10 @@ const PATH: &str = "sd:/ultimate/smush_info/overrides.toml";
 const ATMOSPHERE_MARKER: &str = "sd:/atmosphere/package3";
 const FLAG_RESULTS_LOG: &str = "disable_results_log";
 const FLAG_REPLAY_SAVE: &str = "disable_replay_save";
-const FLAG_RESULTS_SKIP: &str = "disable_results_skip";
 const FLAG_STATS: &str = "disable_stats";
 
 static DISABLE_RESULTS_LOG: AtomicBool = AtomicBool::new(false);
 static DISABLE_REPLAY_SAVE: AtomicBool = AtomicBool::new(false);
-static DISABLE_RESULTS_SKIP: AtomicBool = AtomicBool::new(false);
 static DISABLE_STATS: AtomicBool = AtomicBool::new(false);
 static EMULATOR_MODE: AtomicBool = AtomicBool::new(false);
 
@@ -23,18 +21,15 @@ pub fn replay_save() -> bool {
     !DISABLE_REPLAY_SAVE.load(Ordering::Relaxed)
 }
 
-pub fn results_skip() -> bool {
-    !DISABLE_RESULTS_SKIP.load(Ordering::Relaxed)
-}
-
 /// Versus totals and the openings list. Current percent, stocks, and screen
 /// position stay on either way.
 pub fn stats() -> bool {
     !DISABLE_STATS.load(Ordering::Relaxed)
 }
 
+/// Pad hooks that latch results and pump the direct replay save.
 pub fn hid_enabled() -> bool {
-    replay_save() || results_skip()
+    replay_save()
 }
 
 /// Resolved `emulator_mode`. `auto` is on when `sd:/atmosphere/package3` is missing.
@@ -60,7 +55,6 @@ pub fn load() {
 
     let mut disable_log = false;
     let mut disable_replay = false;
-    let mut disable_skip = false;
     let mut disable_stats = false;
     for line in text.lines() {
         let line = strip_comment(line);
@@ -70,9 +64,6 @@ pub fn load() {
         if line.contains(FLAG_REPLAY_SAVE) {
             disable_replay = true;
         }
-        if line.contains(FLAG_RESULTS_SKIP) {
-            disable_skip = true;
-        }
         if line.contains(FLAG_STATS) {
             disable_stats = true;
         }
@@ -80,15 +71,11 @@ pub fn load() {
 
     DISABLE_RESULTS_LOG.store(disable_log, Ordering::Relaxed);
     DISABLE_REPLAY_SAVE.store(disable_replay, Ordering::Relaxed);
-    DISABLE_RESULTS_SKIP.store(disable_skip, Ordering::Relaxed);
     DISABLE_STATS.store(disable_stats, Ordering::Relaxed);
     if !text.is_empty() {
         println!(
-            "[smush_info] overrides: results_log={} replay_save={} results_skip={} stats={}",
-            !disable_log,
-            !disable_replay,
-            !disable_skip,
-            !disable_stats
+            "[smush_info] overrides: results_log={} replay_save={} stats={}",
+            !disable_log, !disable_replay, !disable_stats
         );
     }
 
