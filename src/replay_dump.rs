@@ -1,5 +1,4 @@
 use crate::results_log;
-use smush_info_shared::hid_route::PadKind;
 use smush_info_shared::{
     abandon_save_for_menu, pause_deadline, save_wait_result, should_arm_save, SaveWait,
 };
@@ -38,7 +37,7 @@ enum Pair {
 // Save is the results-menu task pump (every ~16ms). HID only latches results
 // and times that pump. Results-screen skip (injected A) was removed.
 //
-// Anim (player keeps the pad; HOME and focus push the deadline)
+// Pending (first poll arms; player keeps the pad; HOME and focus push the deadline)
 //   save on + results + not armed -> DumpWait immediately (direct pump)
 //   otherwise -> Done
 // DumpWait (player keeps the pad; pump runs from pad polls)
@@ -47,7 +46,8 @@ enum Pair {
 //   deadline, nothing open, no file -> Done
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum HidPhase {
-    Anim,
+    /// First-poll arm. Same role as the old Anim phase.
+    Pending,
     DumpWait,
     Done,
 }
@@ -65,8 +65,6 @@ struct DumpState {
     phase_began: Option<Instant>,
     /// This results session already armed the direct submit. Cleared on a new match.
     save_armed: bool,
-    /// Set from the pad clock, taken by the match tick. One call.
-    direct_pending: bool,
     logged_live_drop: bool,
     logged_wait_write: bool,
     /// The SD copy of this match's replay is written.
@@ -84,10 +82,9 @@ impl DumpState {
             last_hid_poll: None,
             hid_released: false,
             hid_session: false,
-            hid_phase: HidPhase::Anim,
+            hid_phase: HidPhase::Pending,
             phase_began: None,
             save_armed: false,
-            direct_pending: false,
             logged_live_drop: false,
             logged_wait_write: false,
             bin_landed: false,
@@ -122,7 +119,7 @@ impl DumpState {
             || matches!(self.pair, Pair::Pending { .. } | Pair::Orphan { .. })
     }
 
-    fn wants_hid_mask(&self) -> bool {
+    fn wants_hid_session(&self) -> bool {
         self.hid_session && !self.hid_released
     }
 
@@ -131,10 +128,9 @@ impl DumpState {
         self.last_hid_poll = None;
         self.hid_released = false;
         self.hid_session = false;
-        self.hid_phase = HidPhase::Anim;
+        self.hid_phase = HidPhase::Pending;
         self.phase_began = None;
         self.save_armed = false;
-        self.direct_pending = false;
         self.logged_live_drop = false;
         self.logged_wait_write = false;
         self.bin_landed = false;
@@ -143,6 +139,9 @@ impl DumpState {
     fn finish_dump_wait(&mut self, phase: HidPhase, now: Instant) {
         if self.hid_phase == HidPhase::DumpWait {
             unsafe { crate::end_replay_pump() };
+        }
+        if phase == HidPhase::Done {
+            self.hid_released = true;
         }
         self.set_phase(phase, now);
     }
@@ -153,7 +152,6 @@ impl DumpState {
             unsafe { crate::end_replay_pump() };
         }
         self.save_armed = false;
-        self.direct_pending = false;
         self.hid_released = true;
         self.hid_session = false;
         self.set_phase(HidPhase::Done, now);
@@ -175,7 +173,7 @@ impl DumpState {
         self.hid_began = Some(now);
         self.last_hid_poll = Some(now);
         self.phase_began = Some(now);
-        self.hid_phase = HidPhase::Anim;
+        self.hid_phase = HidPhase::Pending;
         true
     }
 
@@ -445,21 +443,6 @@ pub fn direct_wait_active() -> bool {
     st.save_armed && st.hid_phase == HidPhase::DumpWait
 }
 
-/// Take the one-shot. The caller holds `MATCH_TICK` and drops both locks
-/// before the submit. A second tick sees the flag clear.
-#[inline(never)]
-pub fn take_direct_save() -> bool {
-    let taken = {
-        let mut st = lock_state();
-        if !st.direct_pending {
-            return false;
-        }
-        st.direct_pending = false;
-        true
-    };
-    taken
-}
-
 #[inline(never)]
 pub fn set_results(is_results: bool) {
     let mut st = lock_state();
@@ -468,9 +451,9 @@ pub fn set_results(is_results: bool) {
             st.begin_hid_session();
         }
         st.results = true;
-    } else if !st.wants_hid_mask() {
+    } else if !st.wants_hid_session() {
         // A one-frame `is_result_mode` dip must not drop the latch while the
-        // direct save or skip is still running.
+        // direct save is still running.
         st.results = false;
     }
     if st.hid_session {
@@ -540,23 +523,9 @@ const HID_SESSION_MAX_MS: u128 = 60_000;
 
 fn hid_phase_name(phase: HidPhase) -> &'static str {
     match phase {
-        HidPhase::Anim => "anim",
+        HidPhase::Pending => "pending",
         HidPhase::DumpWait => "dump_wait",
         HidPhase::Done => "done",
-    }
-}
-
-enum HidAction {
-    /// Leave the poll alone: the player keeps full control.
-    Pass,
-    /// Leave the poll alone and end the session.
-    Release,
-}
-
-fn hid_buttons_for_pad(phase: HidPhase) -> HidAction {
-    match phase {
-        HidPhase::Anim | HidPhase::DumpWait => HidAction::Pass,
-        HidPhase::Done => HidAction::Release,
     }
 }
 
@@ -587,15 +556,9 @@ fn pump_save_from_pad() {
     }
 }
 
-fn apply_mask_npads(_state: *mut NpadHandheldState, _count: i32, kind: PadKind) {
-    let _ = hid_mask_buttons(kind);
-    hid_info().hid_masking.store(false, Ordering::Relaxed);
-    pump_save_from_pad();
-}
-
-fn apply_mask_gc(_state: *mut NpadGcState, _count: i32) {
-    let _ = hid_mask_buttons(PadKind::Gc);
-    hid_info().hid_masking.store(false, Ordering::Relaxed);
+/// Session bookkeeping + pad-side pump. Controllers stay live (no mask/inject).
+fn after_npad_poll() {
+    on_npad_poll();
     pump_save_from_pad();
 }
 
@@ -634,16 +597,38 @@ unsafe fn call_orig_states(idx: usize, state: *mut NpadHandheldState, count: i32
     f(state, count, id);
 }
 
-unsafe extern "C" fn hook_state_hh(state: *mut NpadHandheldState, id: *const u32) {
-    note_npad_hit();
-    call_orig_state(0, state, id);
-    apply_mask_npads(state, 1, PadKind::Handheld);
+macro_rules! npad_state_hook {
+    ($name:ident, $idx:expr) => {
+        unsafe extern "C" fn $name(state: *mut NpadHandheldState, id: *const u32) {
+            note_npad_hit();
+            call_orig_state($idx, state, id);
+            after_npad_poll();
+        }
+    };
 }
-unsafe extern "C" fn hook_state_fk(state: *mut NpadHandheldState, id: *const u32) {
-    note_npad_hit();
-    call_orig_state(1, state, id);
-    apply_mask_npads(state, 1, PadKind::FullKey);
+
+macro_rules! npad_states_hook {
+    ($name:ident, $idx:expr) => {
+        unsafe extern "C" fn $name(state: *mut NpadHandheldState, count: i32, id: *const u32) {
+            note_npad_hit();
+            call_orig_states($idx, state, count, id);
+            after_npad_poll();
+        }
+    };
 }
+
+npad_state_hook!(hook_state_hh, 0);
+npad_state_hook!(hook_state_fk, 1);
+npad_state_hook!(hook_state_jd, 3);
+npad_state_hook!(hook_state_jl, 4);
+npad_state_hook!(hook_state_jr, 5);
+
+npad_states_hook!(hook_states_hh, 0);
+npad_states_hook!(hook_states_fk, 1);
+npad_states_hook!(hook_states_jd, 3);
+npad_states_hook!(hook_states_jl, 4);
+npad_states_hook!(hook_states_jr, 5);
+
 unsafe extern "C" fn hook_state_gc(state: *mut NpadGcState, id: *const u32) {
     note_npad_hit();
     let p = ORIG_STATE[2].load(Ordering::Relaxed);
@@ -651,34 +636,9 @@ unsafe extern "C" fn hook_state_gc(state: *mut NpadGcState, id: *const u32) {
         let f: unsafe extern "C" fn(*mut NpadGcState, *const u32) = std::mem::transmute(p);
         f(state, id);
     }
-    apply_mask_gc(state, 1);
-}
-unsafe extern "C" fn hook_state_jd(state: *mut NpadHandheldState, id: *const u32) {
-    note_npad_hit();
-    call_orig_state(3, state, id);
-    apply_mask_npads(state, 1, PadKind::JoyDual);
-}
-unsafe extern "C" fn hook_state_jl(state: *mut NpadHandheldState, id: *const u32) {
-    note_npad_hit();
-    call_orig_state(4, state, id);
-    apply_mask_npads(state, 1, PadKind::JoyLeft);
-}
-unsafe extern "C" fn hook_state_jr(state: *mut NpadHandheldState, id: *const u32) {
-    note_npad_hit();
-    call_orig_state(5, state, id);
-    apply_mask_npads(state, 1, PadKind::JoyRight);
+    after_npad_poll();
 }
 
-unsafe extern "C" fn hook_states_hh(state: *mut NpadHandheldState, count: i32, id: *const u32) {
-    note_npad_hit();
-    call_orig_states(0, state, count, id);
-    apply_mask_npads(state, count, PadKind::Handheld);
-}
-unsafe extern "C" fn hook_states_fk(state: *mut NpadHandheldState, count: i32, id: *const u32) {
-    note_npad_hit();
-    call_orig_states(1, state, count, id);
-    apply_mask_npads(state, count, PadKind::FullKey);
-}
 unsafe extern "C" fn hook_states_gc(state: *mut NpadGcState, count: i32, id: *const u32) {
     note_npad_hit();
     let p = ORIG_STATES[2].load(Ordering::Relaxed);
@@ -686,22 +646,7 @@ unsafe extern "C" fn hook_states_gc(state: *mut NpadGcState, count: i32, id: *co
         let f: unsafe extern "C" fn(*mut NpadGcState, i32, *const u32) = std::mem::transmute(p);
         f(state, count, id);
     }
-    apply_mask_gc(state, count);
-}
-unsafe extern "C" fn hook_states_jd(state: *mut NpadHandheldState, count: i32, id: *const u32) {
-    note_npad_hit();
-    call_orig_states(3, state, count, id);
-    apply_mask_npads(state, count, PadKind::JoyDual);
-}
-unsafe extern "C" fn hook_states_jl(state: *mut NpadHandheldState, count: i32, id: *const u32) {
-    note_npad_hit();
-    call_orig_states(4, state, count, id);
-    apply_mask_npads(state, count, PadKind::JoyLeft);
-}
-unsafe extern "C" fn hook_states_jr(state: *mut NpadHandheldState, count: i32, id: *const u32) {
-    note_npad_hit();
-    call_orig_states(5, state, count, id);
-    apply_mask_npads(state, count, PadKind::JoyRight);
+    after_npad_poll();
 }
 
 fn hook_abs(sym: &[u8], replace: *const c_void, orig: &AtomicPtr<()>) -> bool {
@@ -785,25 +730,24 @@ fn game_unfocused() -> bool {
     s == OE_FOCUS_OUT || s == OE_FOCUS_BG
 }
 
-fn hid_mask_buttons(_kind: PadKind) -> HidAction {
+fn on_npad_poll() {
     if !crate::overrides::hid_enabled() {
-        return HidAction::Pass;
+        return;
     }
     let save_menu = unsafe { !crate::vault_playback() };
     let live = unsafe { live_is_results() };
     let mut st = lock_state();
     // Playback keeps result mode. Leaving the session armed pumps the task
     // against an archive that is not loaded (01793156795).
-    if abandon_save_for_menu(st.wants_hid_mask(), save_menu) {
+    if abandon_save_for_menu(st.wants_hid_session(), save_menu) {
         let now = Instant::now();
         st.save_armed = false;
-        st.direct_pending = false;
         st.hid_released = true;
         st.set_phase(HidPhase::Done, now);
         st.hid_session = false;
         st.last_hid_poll = None;
         hid_store_elapsed(0);
-        return HidAction::Pass;
+        return;
     }
     let now = Instant::now();
     let dump_ok = st.dump_ok();
@@ -813,13 +757,13 @@ fn hid_mask_buttons(_kind: PadKind) -> HidAction {
         st.results = true;
         st.logged_live_drop = false;
         st.begin_hid_session();
-    } else if st.wants_hid_mask() {
+    } else if st.wants_hid_session() {
         // Fighters gone => left results. A brief is_result_mode dip with
         // entries still in keeps the dump pump.
         let entries_gone = unsafe { results_entries_gone() };
         if entries_gone {
             st.end_session_off_results(now);
-            return HidAction::Pass;
+            return;
         }
         if !st.logged_live_drop {
             st.logged_live_drop = true;
@@ -832,7 +776,7 @@ fn hid_mask_buttons(_kind: PadKind) -> HidAction {
         st.hid_session = false;
         st.last_hid_poll = None;
         hid_store_elapsed(0);
-        return HidAction::Pass;
+        return;
     }
     if game_unfocused() {
         if let (Some(last), Some(phase_t)) = (st.last_hid_poll, st.phase_began) {
@@ -840,7 +784,7 @@ fn hid_mask_buttons(_kind: PadKind) -> HidAction {
             st.phase_began = Some(phase_t.checked_add(gap).unwrap_or(phase_t));
         }
         st.last_hid_poll = Some(now);
-        return HidAction::Pass;
+        return;
     }
     let _ = st.absorb_suspend_gap(now);
     st.last_hid_poll = Some(now);
@@ -849,8 +793,8 @@ fn hid_mask_buttons(_kind: PadKind) -> HidAction {
         .map(|t| now.saturating_duration_since(t).as_millis())
         .unwrap_or(0);
     hid_store_elapsed(elapsed);
-    if !st.wants_hid_mask() {
-        return HidAction::Pass;
+    if !st.wants_hid_session() {
+        return;
     }
     if elapsed >= HID_SESSION_MAX_MS && st.hid_phase != HidPhase::Done {
         println!(
@@ -860,28 +804,28 @@ fn hid_mask_buttons(_kind: PadKind) -> HidAction {
         );
         st.set_phase(HidPhase::Done, now);
         st.hid_released = true;
-        return HidAction::Release;
+        return;
     }
     let phase_ms = st
         .phase_began
         .map(|t| now.saturating_duration_since(t).as_millis())
         .unwrap_or(0);
-    if st.hid_phase == HidPhase::Anim {
+    if st.hid_phase == HidPhase::Pending {
         let armed_before = st.save_armed;
         let results = st.results;
         let save_on = crate::overrides::replay_save();
         // Direct task pump: arm as soon as results is latched.
         let outcome = if should_arm_save(results, save_on, armed_before) {
             st.save_armed = true;
-            st.direct_pending = true;
             println!("[smush_info] hid: replay task armed");
             st.set_phase(HidPhase::DumpWait, now);
             "dump_wait"
         } else {
             st.set_phase(HidPhase::Done, now);
+            st.hid_released = true;
             "done"
         };
-        println!("[smush_info] hid: anim done -> {outcome}");
+        println!("[smush_info] hid: pending done -> {outcome}");
     }
     if st.hid_phase == HidPhase::DumpWait {
         let write_open = !st.captures.is_empty();
@@ -912,11 +856,9 @@ fn hid_mask_buttons(_kind: PadKind) -> HidAction {
         }
     }
 
-    let action = hid_buttons_for_pad(st.hid_phase);
-    if matches!(action, HidAction::Release) {
+    if st.hid_phase == HidPhase::Done {
         st.hid_released = true;
     }
-    action
 }
 
 pub fn install() {

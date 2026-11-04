@@ -3,9 +3,8 @@
 
 use skyline::hooks::{getRegionAddress, Region, InlineCtx};
 use skyline::from_c_str;
-use skyline::libc::*;
+use skyline::libc::c_char;
 use std::time::Duration;
-use std::mem::size_of_val;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 
@@ -17,10 +16,9 @@ use smash::Vector2f;
 use smash::Vector3f;
 
 use smush_info_shared::{
-    clear_results_session, handshake_response, menu_is_gameplay, new_match_resets_save,
+    clear_results_session, menu_is_gameplay, new_match_resets_save,
     should_arm_clock_zero, should_pump_replay, should_write_stats_snapshot,
-    still_in_playback,
-    text_frame, Character, Info,
+    still_in_playback, Character, Info,
 };
 use lazy_static::lazy_static;
 
@@ -32,10 +30,16 @@ use smashline::{
 mod conversions;
 use conversions::{kind_to_char, stage_id_to_stage};
 mod match_feed;
+mod match_net;
 mod overrides;
 mod results_log;
 mod replay_dump;
+mod replay_task;
 mod udp;
+
+pub(crate) use replay_task::{
+    end_replay_pump, pump_replay_save, replay_pump_blocking_giveup, replay_submit_offset,
+};
 
 static mut OFFSET1 : usize = 0x1b52a0;
 static mut OFFSET2 : usize = 0x22de458;
@@ -80,188 +84,6 @@ fn as_pixels(vec: Vector3f) -> Vector2f {
     }
 }
 
-fn send_bytes(socket: i32, mut bytes: &[u8]) -> Result<(), i64> {
-    while !bytes.is_empty() {
-        unsafe {
-            let ret = send(socket, bytes.as_ptr() as *const _, bytes.len(), 0);
-            if ret > 0 {
-                bytes = &bytes[ret as usize..];
-            } else if ret == 0 {
-                return Err(32);
-            } else {
-                return Err(*errno_loc());
-            }
-        }
-    }
-    Ok(())
-}
-
-fn close_socket_if_open(socket: &mut i32) {
-    if *socket >= 0 {
-        unsafe {
-            close(*socket);
-        }
-        *socket = -1;
-    }
-}
-
-// SO_SNDTIMEO / SO_RCVTIMEO (BSD-style) so send() fails after a few seconds on dead
-// connections, and a quiet client can be told apart from a browser upgrade.
-const SO_SNDTIMEO: i32 = 0x1005;
-const SO_RCVTIMEO: i32 = 0x1006;
-
-#[repr(C)]
-struct timeval {
-    tv_sec: i64,
-    tv_usec: i64,
-}
-
-/// The console takes a 16-byte `timeval`. Emulators read a 4-byte millisecond
-/// count and ignore the rest, which turns a 1 ms timeout into a blocking recv.
-/// Send both forms; the one the host rejects leaves the other in place.
-fn set_sock_timeout(socket: i32, option: i32, millis: i64) -> bool {
-    unsafe {
-        let tv = timeval {
-            tv_sec: millis / 1000,
-            tv_usec: (millis % 1000) * 1000,
-        };
-        let bsd = setsockopt(
-            socket,
-            SOL_SOCKET,
-            option,
-            &tv as *const _ as *const c_void,
-            size_of_val(&tv) as u32,
-        ) == 0;
-        let ms = millis as u32;
-        let emulated = setsockopt(
-            socket,
-            SOL_SOCKET,
-            option,
-            &ms as *const _ as *const c_void,
-            size_of_val(&ms) as u32,
-        ) == 0;
-        bsd || emulated
-    }
-}
-
-fn set_send_timeout(socket: i32, secs: i64) {
-    if !set_sock_timeout(socket, SO_SNDTIMEO, secs * 1000) {
-        let e = unsafe { *errno_loc() };
-        println!("[smush_info] setsockopt SO_SNDTIMEO failed (errno {}), continuing without send timeout", e);
-    }
-}
-
-fn recv_some(socket: i32, buf: &mut [u8]) -> Result<Option<usize>, i64> {
-    unsafe {
-        let n = recv(socket, buf.as_mut_ptr() as *mut _, buf.len(), 0);
-        if n > 0 {
-            Ok(Some(n as usize))
-        } else if n == 0 {
-            Err(54)
-        } else {
-            let err = *errno_loc();
-            // 11 EAGAIN, 60 the console's ETIMEDOUT, 110 the emulator's.
-            if err == 11 || err == 60 || err == 110 {
-                Ok(None)
-            } else {
-                Err(err)
-            }
-        }
-    }
-}
-
-struct MatchClient {
-    socket: i32,
-    websocket: bool,
-    probing: bool,
-    started: std::time::Instant,
-    request: Vec<u8>,
-}
-
-fn drop_client(client: &mut MatchClient) {
-    close_socket_if_open(&mut client.socket);
-}
-
-/// Browser clients send an upgrade immediately. Raw TCP clients send nothing.
-fn poll_probe(client: &mut MatchClient) -> Result<(), i64> {
-    let mut tmp = [0u8; 512];
-    match recv_some(client.socket, &mut tmp)? {
-        Some(n) => {
-            client.request.extend_from_slice(&tmp[..n]);
-            if client.request.windows(4).any(|w| w == b"\r\n\r\n") || client.request.len() >= 2048 {
-                finish_probe(client)?;
-            }
-            Ok(())
-        }
-        None => {
-            if client.request.is_empty() && client.started.elapsed() >= Duration::from_millis(200) {
-                client.probing = false;
-                client.websocket = false;
-                println!("[smush_info] tcp client connected");
-            } else if !client.request.is_empty() && client.started.elapsed() >= Duration::from_millis(200) {
-                return Err(60);
-            }
-            Ok(())
-        }
-    }
-}
-
-fn finish_probe(client: &mut MatchClient) -> Result<(), i64> {
-    let text = String::from_utf8_lossy(&client.request);
-    let Some(response) = handshake_response(&text) else {
-        println!("[smush_info] closing client that did not request a websocket");
-        return Err(32);
-    };
-    send_bytes(client.socket, response.as_bytes())?;
-    client.request.clear();
-    client.probing = false;
-    client.websocket = true;
-    println!("[smush_info] websocket client connected");
-    Ok(())
-}
-
-fn drain_websocket(socket: i32) -> Result<(), i64> {
-    let mut tmp = [0u8; 256];
-    loop {
-        if recv_some(socket, &mut tmp)?.is_none() {
-            return Ok(());
-        }
-    }
-}
-
-fn accept_clients(listener_socket: i32, incoming: std::sync::mpsc::Sender<i32>) {
-    loop {
-        match accept_client_socket(listener_socket) {
-            Ok(socket) => {
-                if incoming.send(socket).is_err() {
-                    unsafe {
-                        close(socket);
-                    }
-                    break;
-                }
-            }
-            Err(_) => break,
-        }
-    }
-}
-
-fn accept_client_socket(listener_socket: i32) -> Result<i32, i64> {
-    unsafe {
-        let mut client_addr: sockaddr_in = std::mem::zeroed();
-        let mut addr_len: u32 = size_of_val(&client_addr) as u32;
-        let client_socket = accept(
-            listener_socket,
-            &mut client_addr as *mut sockaddr_in as *mut sockaddr,
-            &mut addr_len,
-        );
-        if client_socket < 0 {
-            Err(*errno_loc())
-        } else {
-            Ok(client_socket)
-        }
-    }
-}
-
 // Smashline status scripts — skyline `replace = L2CFighterCommon_*` on common NRO
 // crashes on 13.0.5 when Smashline is loaded.
 /// 0 = not waiting. `u64::MAX` = a results poll is in progress.
@@ -269,7 +91,7 @@ static RESULT_POLL_NOT_BEFORE: AtomicU64 = AtomicU64::new(0);
 const RESULT_POLL_DELAY_MS: u64 = 3_000;
 const RESULT_POLL_RETRY_MS: u64 = 500;
 
-fn mono_ms() -> u64 {
+pub(crate) fn mono_ms() -> u64 {
     lazy_static! {
         static ref MONO_START: std::time::Instant = std::time::Instant::now();
     }
@@ -1064,7 +886,7 @@ fn tick_match_once_per_frame() {
 }
 
 #[inline(never)]
-fn tick_match_state(on_game_thread: bool) {
+pub(crate) fn tick_match_state(on_game_thread: bool) {
     if !on_game_thread {
         // The socket and UDP threads used to call FighterManager here. That races
         // the game thread tearing the match down at the end of a replay, and the
@@ -1092,7 +914,6 @@ fn tick_match_state(on_game_thread: bool) {
         }
         // Pumping continues for the whole dump wait. The task waits on the
         // worker between calls, so once a frame is enough.
-        replay_dump::take_direct_save();
         // Vault playback leaves the wait armed. The task then null-derefs in
         // the unloaded archive (01793156795, text 0x175a0f4).
         let save_menu = unsafe { !vault_playback() };
@@ -1258,168 +1079,6 @@ unsafe fn update_match_state(state: &mut MatchTickState, on_game_thread: bool) {
     }
 }
 
-#[allow(unreachable_code)]
-fn start_server() -> Result<(), i64> {
-    unsafe {
-        let server_addr: sockaddr_in = sockaddr_in {
-            sin_family: AF_INET as _,
-            sin_port: 4242u16.to_be(),
-            sin_len: 4,
-            sin_addr: in_addr {
-                s_addr: INADDR_ANY as _,
-            },
-            sin_zero: [0; 8],
-        };
-
-        let mut listener_socket = socket(AF_INET, SOCK_STREAM, 0);
-        let mut client_socket: i32 = -1;
-
-        macro_rules! dbg_err {
-            ($expr:expr) => {
-                let rval = $expr;
-                if rval < 0 {
-                    let errno = *errno_loc();
-                    dbg!(errno);
-                    close_socket_if_open(&mut client_socket);
-                    close_socket_if_open(&mut listener_socket);
-                    return Err(errno);
-                }
-            };
-        }
-
-        if listener_socket < 0 {
-            let errno = *errno_loc();
-            dbg!(errno);
-            return Err(errno);
-        }
-
-        let flags: u32 = 1;
-
-        dbg_err!(setsockopt(
-            listener_socket,
-            SOL_SOCKET,
-            SO_REUSEADDR,
-            &flags as *const _ as *const c_void,
-            size_of_val(&flags) as u32,
-        ));        
-
-        dbg_err!(setsockopt(
-            listener_socket,
-            SOL_SOCKET,
-            SO_KEEPALIVE,
-            &flags as *const _ as *const c_void,
-            size_of_val(&flags) as u32,
-        ));
-
-        dbg_err!(bind(
-            listener_socket,
-            &server_addr as *const sockaddr_in as *const sockaddr,
-            size_of_val(&server_addr) as u32,
-        ));
-
-        dbg_err!(listen(listener_socket, 8));
-        println!("[smush_info] match socket listening on 4242");
-        let (incoming_tx, incoming_rx) = std::sync::mpsc::channel();
-        let accept_listener = listener_socket;
-        std::thread::spawn(move || accept_clients(accept_listener, incoming_tx));
-
-        let mut clients: Vec<MatchClient> = Vec::new();
-        loop {
-            loop {
-                match incoming_rx.try_recv() {
-                    Ok(socket) => {
-                        set_send_timeout(socket, 3);
-                        if !set_sock_timeout(socket, SO_RCVTIMEO, 1) {
-                            println!("[smush_info] no receive timeout, handshake may block");
-                        }
-                        println!("[smush_info] match client accepted");
-                        let keepalive: u32 = 1;
-                        setsockopt(
-                            socket,
-                            SOL_SOCKET,
-                            SO_KEEPALIVE,
-                            &keepalive as *const _ as *const c_void,
-                            size_of_val(&keepalive) as u32,
-                        );
-                        clients.push(MatchClient {
-                            socket,
-                            websocket: false,
-                            probing: true,
-                            started: std::time::Instant::now(),
-                            request: Vec::new(),
-                        });
-                    }
-                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                        for client in &mut clients {
-                            drop_client(client);
-                        }
-                        close_socket_if_open(&mut listener_socket);
-                        return Err(54);
-                    }
-                }
-            }
-
-            let mut index = 0;
-            while index < clients.len() {
-                if !clients[index].probing {
-                    index += 1;
-                    continue;
-                }
-                if let Err(errno) = poll_probe(&mut clients[index]) {
-                    println!("[smush_info] client dropped during handshake (errno {})", errno);
-                    drop_client(&mut clients[index]);
-                    clients.swap_remove(index);
-                } else {
-                    index += 1;
-                }
-            }
-
-            if clients.iter().any(|client| !client.probing) {
-                tick_match_state(false);
-                let payload = serde_json::to_vec(&GAME_INFO).unwrap();
-                let websocket_frame = text_frame(&payload);
-                let mut tcp_frame = payload;
-                tcp_frame.push(b'\n');
-                index = 0;
-                while index < clients.len() {
-                    if clients[index].probing {
-                        index += 1;
-                        continue;
-                    }
-                    let sent = if clients[index].websocket {
-                        drain_websocket(clients[index].socket)
-                            .and_then(|_| send_bytes(clients[index].socket, &websocket_frame))
-                    } else {
-                        send_bytes(clients[index].socket, &tcp_frame)
-                    };
-                    match sent {
-                        Ok(()) => index += 1,
-                        Err(errno) => {
-                            println!("[smush_info] client dropped (errno {})", errno);
-                            drop_client(&mut clients[index]);
-                            clients.swap_remove(index);
-                        }
-                    }
-                }
-            }
-            std::thread::sleep(Duration::from_millis(16));
-        }
-        /*let magic = recv_bytes(tcp_socket, 4).unwrap();
-        if &magic == b"HRLD" {
-            let num_bytes = recv_u32(tcp_socket).unwrap();
-        } else if &magic == b"ECHO" {
-            println!("\n\n----\nECHO\n\n");
-        } else {
-            println!("Invalid magic")
-        }*/
-        
-        dbg_err!(close(listener_socket));
-    }
-
-    Ok(())
-}
-
 pub fn offset_to_addr(offset: usize) -> *const () {
     unsafe {
         (getRegionAddress(Region::Text) as *const u8).offset(offset as isize) as _
@@ -1519,27 +1178,6 @@ pub(crate) fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> 
 
 pub static mut FIGHTER_MANAGER_ADDR: usize = 0;
 
-pub unsafe fn note_fighter_from_modules(module_accessor: &mut app::BattleObjectModuleAccessor) {
-    let entry_id = WorkModule::get_int(module_accessor, *FIGHTER_INSTANCE_WORK_ID_INT_ENTRY_ID) as i32;
-    if entry_id < 0 {
-        return;
-    }
-    let player_num = entry_id as usize;
-    if player_num >= GAME_INFO.players.len() {
-        return;
-    }
-    let character = kind_to_char(get_kind(module_accessor)) as u32;
-    let damage = DamageModule::damage(module_accessor, 0);
-    let skin = WorkModule::get_int(module_accessor, *FIGHTER_INSTANCE_WORK_ID_INT_COLOR) as u32;
-    let team = TeamModule::team_no(module_accessor) as i32;
-    let player = &GAME_INFO.players[player_num];
-    player.is_in_game.store(true, Ordering::SeqCst);
-    player.character.store(character, Ordering::SeqCst);
-    player.damage.store(damage, Ordering::SeqCst);
-    player.skin.store(skin, Ordering::SeqCst);
-    player.team.store(team, Ordering::SeqCst);
-}
-
 pub unsafe fn set_player_information(module_accessor: &mut app::BattleObjectModuleAccessor) {
     let entry_id = WorkModule::get_int(module_accessor, *FIGHTER_INSTANCE_WORK_ID_INT_ENTRY_ID) as i32;
     if entry_id < 0 {
@@ -1581,8 +1219,8 @@ pub unsafe fn set_player_information(module_accessor: &mut app::BattleObjectModu
     GAME_INFO.players[player_num].is_cpu.store(is_cpu, Ordering::SeqCst);
     GAME_INFO.players[player_num].skin.store(skin, Ordering::SeqCst);
     GAME_INFO.players[player_num].team.store(team, Ordering::SeqCst);
-    println!("ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ player tag {}", get_tag_of_player(player_num));
-    GAME_INFO.players[player_num].name.store_str(Some(&get_tag_of_player(player_num)), Ordering::SeqCst);
+    let tag = get_tag_of_player(player_num);
+    GAME_INFO.players[player_num].name.store_str(Some(&tag), Ordering::SeqCst);
 }
 
 // UPDATE_TAG unchanged across 13.0.4/13.0.5. Data offsets slide +0x1000 on 13.0.5;
@@ -1595,53 +1233,6 @@ static mut PLAYER_SAVE_ADDRESS: *const u64 = 0x0 as *const u64;
 static mut PLAYER_TAG_OFFSET: usize = 0x52C5758;
 static mut MENU_OFFSET: usize = 0x53050f0;
 static mut STAGE_SELECTED_OFFSET: usize = 0x23355d4;
-// `void submit(Task*)`. Same text offset on 13.0.4 and 13.0.5. The pump is what
-// runs; a zero offset means the entry was not found and must not be called.
-static mut REPLAY_SUBMIT_OFFSET: usize = 0x143d5d0;
-// BSS box. `task = *(u64*)(*(u64*)(image + slot))`.
-static mut REPLAY_TASK_SLOT_OFFSET: usize = 0x52c35b8;
-// Results menu: alloc(align, size) then `ctor(box)` which stores the task in the box.
-// The menu only runs this from its save step, which the direct path never enters.
-static mut REPLAY_TASK_ALLOC_OFFSET: usize = 0x392e290;
-static mut REPLAY_TASK_CTOR_OFFSET: usize = 0x143e850;
-// `*(u64*)(image + slot)` is the replay manager. The menu calls
-// `(*(manager+0x588))[0x18/8](manager+0x588)` and stores the result at task+0x198.
-// The write callback bails when that field is still 0.
-static mut REPLAY_SOURCE_OFFSET: usize = 0x52c50f0;
-// Results pump. The menu calls this once a frame. State 1 enqueues, then
-// later frames wait until the worker sets task+0x11c before advancing.
-// Calling submit on the same tick replaces that callback, so the worker
-// never opens a file.
-static mut REPLAY_TASK_PUMP_OFFSET: usize = 0x143ea40;
-/// Match ticks are once a millisecond. The results menu pumps once a frame,
-/// and spinning the state machine faster than that hitches the results screen.
-const REPLAY_PUMP_INTERVAL_MS: u64 = 16;
-static mut PUMP_LIVE: bool = false;
-static mut PUMP_BUSY: bool = false;
-static mut PUMP_TASK: u64 = 0;
-static mut PUMP_NOT_BEFORE: u64 = 0;
-/// `mono_ms` when `task+0x108` first read 1 or 2. 0 while the task is still stepping.
-static mut PUMP_SETTLED_AT: u64 = 0;
-
-/// True while the results task is still stepping, or for `grace_ms` after it
-/// reports done. The vault file often closes in that window. Ending the wait
-/// first gives the pads back, and the skip pulse never starts.
-pub(crate) fn replay_pump_blocking_giveup(grace_ms: u64) -> bool {
-    unsafe {
-        if !PUMP_LIVE {
-            return false;
-        }
-        if PUMP_SETTLED_AT == 0 {
-            return true;
-        }
-        mono_ms().saturating_sub(PUMP_SETTLED_AT) < grace_ms
-    }
-}
-
-pub(crate) fn replay_submit_offset() -> usize {
-    unsafe { REPLAY_SUBMIT_OFFSET }
-}
-
 fn display_version() -> String {
     skyline::nn::oe::get_display_version()
 }
@@ -1664,189 +1255,55 @@ fn uses_13_0_5_offsets(version: &str) -> bool {
 
 unsafe fn apply_version_offsets() {
     let version = display_version();
-    if uses_13_0_5_offsets(&version) {
+    let use_13_0_5 = uses_13_0_5_offsets(&version);
+    if use_13_0_5 {
         PLAYER_SAVE_OFFSET = 0x5314510;
         PLAYER_TAG_OFFSET = 0x52C5758;
         MENU_OFFSET = 0x53050f0;
         STAGE_SELECTED_OFFSET = 0x23355d4;
-        REPLAY_SUBMIT_OFFSET = 0x143d5d0;
-        REPLAY_TASK_SLOT_OFFSET = 0x52c35b8;
-        REPLAY_TASK_ALLOC_OFFSET = 0x392e290;
-        REPLAY_TASK_CTOR_OFFSET = 0x143e850;
-        REPLAY_SOURCE_OFFSET = 0x52c50f0;
-        REPLAY_TASK_PUMP_OFFSET = 0x143ea40;
         println!("[smush_info] game {} — using 13.0.5 offsets", version);
     } else {
         PLAYER_SAVE_OFFSET = 0x5313510;
         PLAYER_TAG_OFFSET = 0x52C4758;
         MENU_OFFSET = 0x53040f0;
         STAGE_SELECTED_OFFSET = 0x2335184;
-        REPLAY_SUBMIT_OFFSET = 0x143d5d0;
-        REPLAY_TASK_SLOT_OFFSET = 0x52c25b8;
-        REPLAY_TASK_ALLOC_OFFSET = 0x392dce0;
-        REPLAY_TASK_CTOR_OFFSET = 0x143e850;
-        REPLAY_SOURCE_OFFSET = 0x52c40f0;
-        REPLAY_TASK_PUMP_OFFSET = 0x143ea40;
         println!("[smush_info] game {} — using 13.0.4 offsets", version);
     }
+    replay_task::apply_version_offsets(use_13_0_5);
 }
 
-/// Allocate the 8-byte box and run the results-menu constructor.
-/// Returns 0 when the allocator or the constructor offset is missing.
-#[inline(never)]
-unsafe fn make_replay_task_box() -> u64 {
-    let alloc_off = REPLAY_TASK_ALLOC_OFFSET;
-    let ctor_off = REPLAY_TASK_CTOR_OFFSET;
-    if alloc_off == 0 || ctor_off == 0 {
-        return 0;
+unsafe fn utf16_zstring(addr: *const u16) -> String {
+    let mut len = 0;
+    while *addr.add(len) != 0 {
+        len += 1;
     }
-    let alloc: unsafe extern "C" fn(u64, u64) -> u64 =
-        std::mem::transmute(offset_to_addr(alloc_off) as *const ());
-    let ctor: unsafe extern "C" fn(u64) =
-        std::mem::transmute(offset_to_addr(ctor_off) as *const ());
-    // Same arguments the results menu passes: align 16, size 8.
-    let box_ptr = std::hint::black_box(alloc)(0x10, 8);
-    if box_ptr == 0 {
-        return 0;
-    }
-    std::hint::black_box(ctor)(box_ptr);
-    box_ptr
-}
-
-/// Same call the results menu makes after the constructor. Returns the pointer
-/// stored at `task+0x198`, or 0 when the manager is not there.
-#[inline(never)]
-unsafe fn attach_replay_source(task: u64) -> u64 {
-    let slot_off = REPLAY_SOURCE_OFFSET;
-    if slot_off == 0 || task == 0 {
-        return 0;
-    }
-    let root = *(offset_to_addr(slot_off) as *const u64);
-    if root == 0 {
-        return 0;
-    }
-    let vt = *((root + 0x588) as *const u64);
-    if vt == 0 {
-        return 0;
-    }
-    let method = *((vt + 0x18) as *const u64);
-    if method == 0 {
-        return 0;
-    }
-    let fetch: unsafe extern "C" fn(u64) -> u64 =
-        std::mem::transmute(method as *const ());
-    let replay = std::hint::black_box(fetch)(root + 0x588);
-    *((task + 0x198) as *mut u64) = replay;
-    replay
-}
-
-/// Drop the in-flight pump so the next dump wait builds a new task.
-pub(crate) unsafe fn end_replay_pump() {
-    PUMP_LIVE = false;
-    PUMP_TASK = 0;
-    PUMP_NOT_BEFORE = 0;
-    PUMP_SETTLED_AT = 0;
-}
-
-/// Build the task the way the results menu does, once per dump wait.
-/// A fresh box each wait: a finished task left in the slot would not save again.
-unsafe fn start_replay_task() -> bool {
-    let slot_off = REPLAY_TASK_SLOT_OFFSET;
-    let pump_off = REPLAY_TASK_PUMP_OFFSET;
-    if slot_off == 0 || pump_off == 0 {
-        return false;
-    }
-    let box_ptr = make_replay_task_box();
-    if box_ptr == 0 {
-        return false;
-    }
-    let slot = offset_to_addr(slot_off) as *mut u64;
-    *slot = box_ptr;
-    let task = *(box_ptr as *const u64);
-    if task == 0 {
-        return false;
-    }
-    attach_replay_source(task);
-    *((task as *mut u8).add(0xa8) as *mut i32) = 1;
-    *((task as *mut u8).add(0x108) as *mut u32) = 0;
-    PUMP_TASK = task;
-    PUMP_SETTLED_AT = 0;
-    true
-}
-
-/// One pump about every frame. The menu does this until `task+0x108` is 1 or 2.
-/// Submit is a later state; calling it here overwrites the callback state 1 queued.
-/// Also called from the pad hook: the results screen does not return through
-/// `after_frame_tick`, so this is what advances the save there.
-#[inline(never)]
-pub(crate) unsafe fn pump_replay_save() {
-    if PUMP_BUSY {
-        return;
-    }
-    let now = mono_ms();
-    if PUMP_LIVE && now < PUMP_NOT_BEFORE {
-        return;
-    }
-    PUMP_BUSY = true;
-    if !PUMP_LIVE {
-        if !start_replay_task() {
-            PUMP_BUSY = false;
-            return;
-        }
-        PUMP_LIVE = true;
-    }
-    let task = PUMP_TASK;
-    let status_now = *((task as *const u8).add(0x108) as *const u32);
-    if status_now == 1 || status_now == 2 {
-        if PUMP_SETTLED_AT == 0 {
-            PUMP_SETTLED_AT = now;
-        }
-        PUMP_NOT_BEFORE = u64::MAX;
-        PUMP_BUSY = false;
-        return;
-    }
-    let pump_off = REPLAY_TASK_PUMP_OFFSET;
-    let pump: unsafe extern "C" fn(u64) -> u32 =
-        std::mem::transmute(offset_to_addr(pump_off) as *const ());
-    std::hint::black_box(pump)(task);
-    PUMP_NOT_BEFORE = now.saturating_add(REPLAY_PUMP_INTERVAL_MS);
-    PUMP_BUSY = false;
+    let slice = std::slice::from_raw_parts(addr, len);
+    String::from_utf16_lossy(slice)
 }
 
 pub fn get_tag_of_player(player_index: usize) -> String {
     let player_tag_offset = unsafe { PLAYER_TAG_OFFSET } + (player_index * 0x260);
     let player_tag_addr: *const u16 = offset_to_addr(player_tag_offset) as *const u16;
-    
-    unsafe {
-        let mut len = 0;
-        while *player_tag_addr.add(len) != 0 {
-            len += 1;
-        }
-        let slice = std::slice::from_raw_parts(player_tag_addr, len);
-        String::from_utf16_lossy(slice)
-    }
+    unsafe { utf16_zstring(player_tag_addr) }
 }
 
 pub fn get_tag_from_save(tag_index: u8) -> String {
     unsafe {
-        let addr = (***((*((*PLAYER_SAVE_ADDRESS) as *const u64) + 0x58) as *const *const *const u64) + ((tag_index as u64) * 0xF7D8) + 0xC) as *const u16;
-        let mut len = 0;
-        while *addr.add(len) != 0 {
-            len += 1;
-        }
-
-        let slice = std::slice::from_raw_parts(addr, len);
-        String::from_utf16_lossy(slice)
+        let addr = (***((*((*PLAYER_SAVE_ADDRESS) as *const u64) + 0x58) as *const *const *const u64)
+            + ((tag_index as u64) * 0xF7D8)
+            + 0xC) as *const u16;
+        utf16_zstring(addr)
     }
 }
 
 #[skyline::hook(offset = UPDATE_TAG_FOR_PLAYER_OFFSET)]
-pub fn update_tag_for_player(param_1: u64, tag_index: *const u8){
+pub fn update_tag_for_player(param_1: u64, tag_index: *const u8) {
     unsafe {
         let player_index = *((param_1 as *mut u8).offset(0x1d4) as *mut i32) as usize;
-        GAME_INFO.players[player_index].name.store_str(Some(&get_tag_from_save(*tag_index)), Ordering::SeqCst);
-        
-        println!("AAAAAAAAAAAAAAAAAAAA PLAYER NAME OF INDEX {} IS {}", player_index, get_tag_from_save(*tag_index));
+        if player_index < GAME_INFO.players.len() {
+            let tag = get_tag_from_save(*tag_index);
+            GAME_INFO.players[player_index].name.store_str(Some(&tag), Ordering::SeqCst);
+        }
         call_original!(param_1, tag_index);
     }
 }
@@ -1911,7 +1368,9 @@ fn css_fighter_selected(ctx: &InlineCtx) {
     let skin = infos.fighter_slot as u32;
     let character = kind_to_char(fighter_id) as u32;
     let port = (infosbasic.field77_0x78 & 0xFFFF) as usize;
-    println!("character {}\nskin {}\nport {}\n ", character, skin, port);
+    if port >= GAME_INFO.players.len() {
+        return;
+    }
     GAME_INFO.players[port].character.store(character, Ordering::SeqCst);
     GAME_INFO.players[port].skin.store(skin, Ordering::SeqCst);
 }
@@ -1926,34 +1385,6 @@ fn search_offsets() {
             FIGHTER_SELECTED_OFFSET = offset + 0x10;
         } else {
             println!("Error: no offset found for 'css_fighter_selected'. Keeping the built-in 13.0.5 offset.");
-        }
-    }
-}
-
-fn server_supervisor() {
-    // Give network stack time to come up (UDP thread uses 5s delay for the same reason).
-    std::thread::sleep(Duration::from_secs(2));
-    let backoff_steps = [1u64, 2, 5];
-    let mut restart_count: usize = 0;
-    loop {
-        println!("[smush_info] starting tcp server");
-        match start_server() {
-            Ok(_) => {
-                restart_count = 0;
-                std::thread::sleep(Duration::from_secs(1));
-            }
-            Err(errno) => {
-                restart_count = restart_count.saturating_add(1);
-                let backoff = backoff_steps
-                    .get(restart_count.saturating_sub(1))
-                    .copied()
-                    .unwrap_or(5);
-                println!(
-                    "[smush_info] tcp server exited (errno {}), restarting in {}s",
-                    errno, backoff
-                );
-                std::thread::sleep(Duration::from_secs(backoff));
-            }
         }
     }
 }
@@ -1975,50 +1406,63 @@ extern "C" {
     fn special_lw_select_index(fighter: *mut app::Fighter, index: i32);
 }
 
+unsafe fn brave_player_num(fighter: &mut app::Fighter) -> Option<usize> {
+    let module_accessor: *mut app::BattleObjectModuleAccessor = app::sv_battle_object::module_accessor(
+        *(((&mut (fighter.battle_object) as *mut app::BattleObject) as u64 + 8) as *mut u32),
+    );
+    let entry_id = WorkModule::get_int(module_accessor, *FIGHTER_INSTANCE_WORK_ID_INT_ENTRY_ID) as i32;
+    if entry_id < 0 {
+        return None;
+    }
+    let player_num = entry_id as usize;
+    if player_num >= GAME_INFO.players.len() {
+        None
+    } else {
+        Some(player_num)
+    }
+}
+
 #[skyline::hook(replace = special_lw_open_command)]
 pub unsafe fn special_lw_open_command_hook(fighter: &mut app::Fighter) {
-    let module_accessor: *mut app::BattleObjectModuleAccessor = app::sv_battle_object::module_accessor(*(((&mut (fighter.battle_object) as *mut app::BattleObject) as u64 + 8) as *mut u32)); //this is a mess
-    let entry_id = WorkModule::get_int(module_accessor, *FIGHTER_INSTANCE_WORK_ID_INT_ENTRY_ID) as i32;
-    let player_num = entry_id as usize;
-
-    GAME_INFO.players[player_num].hero_menu_open.store(true, Ordering::SeqCst);
-    GAME_INFO.players[player_num].hero_menu_selection.store(0, Ordering::SeqCst);
-
+    if let Some(player_num) = brave_player_num(fighter) {
+        GAME_INFO.players[player_num].hero_menu_open.store(true, Ordering::SeqCst);
+        GAME_INFO.players[player_num].hero_menu_selection.store(0, Ordering::SeqCst);
+    }
     call_original!(fighter);
 }
 
 #[skyline::hook(replace = special_lw_select_index)]
 pub unsafe fn special_lw_select_index_hook(fighter: &mut app::Fighter, index: i32) {
-    let module_accessor: *mut app::BattleObjectModuleAccessor = app::sv_battle_object::module_accessor(*(((&mut (fighter.battle_object) as *mut app::BattleObject) as u64 + 8) as *mut u32)); //this is a mess
-    let entry_id = WorkModule::get_int(module_accessor, *FIGHTER_INSTANCE_WORK_ID_INT_ENTRY_ID) as i32;
-    let player_num = entry_id as usize;
-
-    GAME_INFO.players[player_num].hero_menu_selection.store(index as u32, Ordering::SeqCst);
+    if let Some(player_num) = brave_player_num(fighter) {
+        GAME_INFO.players[player_num].hero_menu_selection.store(index as u32, Ordering::SeqCst);
+    }
     call_original!(fighter, index);
 }
 
 #[skyline::hook(replace = special_lw_decide_command)]
-pub unsafe fn special_lw_decide_command_hook(fighter: &mut app::Fighter, command: app::FighterBraveSpecialLwCommand, idx: i32) {
-    let module_accessor: *mut app::BattleObjectModuleAccessor = app::sv_battle_object::module_accessor(*(((&mut (fighter.battle_object) as *mut app::BattleObject) as u64 + 8) as *mut u32)); //this is a mess
-    let entry_id = WorkModule::get_int(module_accessor, *FIGHTER_INSTANCE_WORK_ID_INT_ENTRY_ID) as i32;
-    let player_num = entry_id as usize;
-
-    GAME_INFO.players[player_num].hero_menu_selection.store(idx as u32, Ordering::SeqCst);
-    GAME_INFO.players[player_num].hero_menu_selected.store(true, Ordering::SeqCst);
-
+pub unsafe fn special_lw_decide_command_hook(
+    fighter: &mut app::Fighter,
+    command: app::FighterBraveSpecialLwCommand,
+    idx: i32,
+) {
+    if let Some(player_num) = brave_player_num(fighter) {
+        GAME_INFO.players[player_num].hero_menu_selection.store(idx as u32, Ordering::SeqCst);
+        GAME_INFO.players[player_num].hero_menu_selected.store(true, Ordering::SeqCst);
+    }
     call_original!(fighter, command, idx);
 }
 
 #[skyline::hook(replace = special_lw_close_window)]
-pub unsafe fn special_lw_close_window_hook(fighter: &mut app::Fighter, arg2: bool, no_decide: bool, arg4: bool) {
-    let module_accessor: *mut app::BattleObjectModuleAccessor = app::sv_battle_object::module_accessor(*(((&mut (fighter.battle_object) as *mut app::BattleObject) as u64 + 8) as *mut u32)); //this is a mess
-    let entry_id = WorkModule::get_int(module_accessor, *FIGHTER_INSTANCE_WORK_ID_INT_ENTRY_ID) as i32;
-    let player_num = entry_id as usize;
-
-    
-    GAME_INFO.players[player_num].hero_menu_selected.store(false, Ordering::SeqCst);
-    GAME_INFO.players[player_num].hero_menu_open.store(false, Ordering::SeqCst);
-
+pub unsafe fn special_lw_close_window_hook(
+    fighter: &mut app::Fighter,
+    arg2: bool,
+    no_decide: bool,
+    arg4: bool,
+) {
+    if let Some(player_num) = brave_player_num(fighter) {
+        GAME_INFO.players[player_num].hero_menu_selected.store(false, Ordering::SeqCst);
+        GAME_INFO.players[player_num].hero_menu_open.store(false, Ordering::SeqCst);
+    }
     call_original!(fighter, arg2, no_decide, arg4);
 }
 
@@ -2087,7 +1531,7 @@ pub fn main() {
     install_results_poll_hook();
     install_fighter_status_hooks();
 
-    std::thread::spawn(server_supervisor);
+    std::thread::spawn(match_net::server_supervisor);
 
     std::thread::spawn(|| {
         std::thread::sleep(std::time::Duration::from_secs(5));

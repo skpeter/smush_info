@@ -11,6 +11,18 @@ union Transmute {
     bits: [u64; 4],
 }
 
+/// UTF-16LE bytes for a name tag, zero-padded to 32 bytes (16 code units).
+pub fn utf16le_tag_bytes(s: &str) -> [u8; 32] {
+    let mut result = [0u8; 32];
+    let mut i = 0;
+    for c in s.encode_utf16().take(16) {
+        result[i] = (c & 0xFF) as u8;
+        result[i + 1] = ((c >> 8) & 0xFF) as u8;
+        i += 2;
+    }
+    result
+}
+
 impl AtomicName {
     pub const fn new(val: Option<[u8; 32]>) -> Self {
         let chars = if let Some(x) = val {
@@ -27,13 +39,7 @@ impl AtomicName {
     }
 
     pub fn from_str(val: &str) -> Self {
-        let utf16le: Vec<u16> = val.encode_utf16().collect();
-        let mut result = [0; 32];
-        for (i, &c) in utf16le.iter().take(32).enumerate() {
-            result[i * 2] = (c & 0xFF) as u8;
-            result[i * 2 + 1] = ((c >> 8) & 0xFF) as u8;
-        }
-        Self::new(Some(result))
+        Self::new(Some(utf16le_tag_bytes(val)))
     }
 
     pub fn load(&self, order: Ordering) -> Option<[u8; 32]> {
@@ -75,17 +81,7 @@ impl AtomicName {
     }
 
     pub fn store_str(&self, val: Option<&str>, order: Ordering) {
-        self.store(val.map(|x| {
-            let utf16le: Vec<u16> = x.encode_utf16().collect();
-            let mut result = [0; 32];
-            let mut i = 0;
-            for &c in utf16le.iter().take(16) {
-                result[i] = (c & 0xFF) as u8;
-                result[i + 1] = ((c >> 8) & 0xFF) as u8;
-                i += 2;
-            }
-            result
-        }), order);
+        self.store(val.map(utf16le_tag_bytes), order);
     }
 }
 
@@ -101,7 +97,7 @@ impl Serialize for AtomicName {
         S: Serializer,
     {
         match self.load_string(Ordering::SeqCst) {
-            Some(s) => serializer.serialize_str(&String::from_utf16_lossy(&s.encode_utf16().collect::<Vec<u16>>())),
+            Some(s) => serializer.serialize_str(&s),
             None => serializer.serialize_none(),
         }
     }
@@ -113,44 +109,7 @@ impl<'de> Deserialize<'de> for AtomicName {
         D: Deserializer<'de>,
     {
         let x = <Option<String>>::deserialize(deserializer)?;
-        Ok(AtomicName::new(x.map(|x| {
-            let utf16_bytes = x.encode_utf16().collect::<Vec<u16>>();
-            let mut bytes = utf16_bytes.iter().flat_map(|&c| [c as u8, (c >> 8) as u8]);
-            [
-                bytes.next().unwrap_or(0),
-                bytes.next().unwrap_or(0),
-                bytes.next().unwrap_or(0),
-                bytes.next().unwrap_or(0),
-                bytes.next().unwrap_or(0),
-                bytes.next().unwrap_or(0),
-                bytes.next().unwrap_or(0),
-                bytes.next().unwrap_or(0),
-                bytes.next().unwrap_or(0),
-                bytes.next().unwrap_or(0),
-                bytes.next().unwrap_or(0),
-                bytes.next().unwrap_or(0),
-                bytes.next().unwrap_or(0),
-                bytes.next().unwrap_or(0),
-                bytes.next().unwrap_or(0),
-                bytes.next().unwrap_or(0),
-                bytes.next().unwrap_or(0),
-                bytes.next().unwrap_or(0),
-                bytes.next().unwrap_or(0),
-                bytes.next().unwrap_or(0),
-                bytes.next().unwrap_or(0),
-                bytes.next().unwrap_or(0),
-                bytes.next().unwrap_or(0),
-                bytes.next().unwrap_or(0),
-                bytes.next().unwrap_or(0),
-                bytes.next().unwrap_or(0),
-                bytes.next().unwrap_or(0),
-                bytes.next().unwrap_or(0),
-                bytes.next().unwrap_or(0),
-                bytes.next().unwrap_or(0),
-                bytes.next().unwrap_or(0),
-                bytes.next().unwrap_or(0),
-            ]
-        })))
+        Ok(AtomicName::new(x.as_deref().map(utf16le_tag_bytes)))
     }
 }
 
@@ -162,7 +121,6 @@ mod atomic_name_tests {
     fn test_serde_round_trip() {
         let x = AtomicName::from_str("つыůš");
         let json = serde_json::to_string(&x).unwrap();
-        // println!("{}to_string(&x));
         assert_eq!(json, "\"つыůš\"");
         let y: AtomicName = serde_json::from_str(&json).unwrap();
         assert_eq!(x.load(Ordering::SeqCst), y.load(Ordering::SeqCst));

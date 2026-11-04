@@ -5,11 +5,16 @@ use smush_info_shared::{
     MatchStats, OpeningRecord, Phase,
 };
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 static STATS_SAMPLING: AtomicBool = AtomicBool::new(false);
 /// Temporary tick owner before both fighters are marked in-game.
 static FALLBACK_TICK_OWNER: AtomicUsize = AtomicUsize::new(usize::MAX);
-static mut STATS: MatchStats = MatchStats::new();
+static STATS: Mutex<MatchStats> = Mutex::new(MatchStats::new());
+
+fn lock_stats() -> std::sync::MutexGuard<'static, MatchStats> {
+    STATS.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 pub fn set_sampling(enabled: bool) {
     STATS_SAMPLING.store(enabled, Ordering::SeqCst);
@@ -47,9 +52,7 @@ pub fn is_tick_owner(entry: usize, info: &Info) -> bool {
 
 pub fn reset(info: &Info) {
     FALLBACK_TICK_OWNER.store(usize::MAX, Ordering::SeqCst);
-    unsafe {
-        STATS.reset();
-    }
+    lock_stats().reset();
     if let Some(pair) = active_pair(info) {
         info.players[pair[0]].clear_match_stats();
         info.players[pair[1]].clear_match_stats();
@@ -61,7 +64,7 @@ pub fn reset(info: &Info) {
 }
 
 pub fn openings() -> [Vec<OpeningRecord>; 2] {
-    unsafe { STATS.openings() }
+    lock_stats().openings()
 }
 
 pub unsafe fn capture(
@@ -109,7 +112,8 @@ pub unsafe fn capture(
         character: info.players[entry].character.load(Ordering::SeqCst),
     };
     // The sample keeps its own stocks. Do not write players[].stocks here.
-    let stepped = STATS.push(slot, sample);
+    // Game module reads finished above; lock only for the calculator update.
+    let stepped = lock_stats().push(slot, sample);
     if stepped {
         publish(info);
     }
@@ -125,11 +129,12 @@ pub fn sync_stocks(info: &Info) {
     let Some(pair) = active_pair(info) else {
         return;
     };
-    unsafe {
+    {
+        let mut stats = lock_stats();
         for slot in 0..2 {
             let entry = pair[slot];
             let player = &info.players[entry];
-            STATS.note_stocks(
+            stats.note_stocks(
                 slot,
                 player.stocks.load(Ordering::SeqCst),
                 player.self_destructs.load(Ordering::SeqCst),
@@ -140,7 +145,7 @@ pub fn sync_stocks(info: &Info) {
 }
 
 pub fn publish(info: &Info) {
-    let summary = unsafe { STATS.summary() };
+    let summary = lock_stats().summary();
     let Some(pair) = active_pair(info) else {
         return;
     };
