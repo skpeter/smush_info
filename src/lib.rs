@@ -199,8 +199,9 @@ fn poll_deferred_results() {
 }
 
 /// One live frame for one fighter. No-op on the results screen, at clock 0,
-/// and once a death has scheduled the KO-camera wait. Does not read
-/// `FighterInformation`. Screen position is updated only on a live frame.
+/// and once a death has scheduled the KO-camera wait. `FighterInformation` is
+/// only read once after Entry/Rebirth to seed stocks (never on the death frame).
+/// Screen position is updated only on a live frame.
 unsafe fn sample_live_fighter(fighter: &mut SmashlineFighterCommon) {
     if hooks_quiesced() {
         return;
@@ -229,17 +230,31 @@ unsafe fn sample_live_fighter(fighter: &mut SmashlineFighterCommon) {
     if entry_id < 0 {
         return;
     }
-    if StatusModule::status_kind(module_accessor) == *FIGHTER_STATUS_KIND_DEAD {
+    let status = StatusModule::status_kind(module_accessor);
+    if status == *FIGHTER_STATUS_KIND_DEAD {
         return;
+    }
+    // Stocks used to be written in Entry Pre via FighterInformation. That ran
+    // before article setup (01794010404). Seed them here once Entry has left,
+    // so the live feed and MatchStats still see the starting stock count.
+    let seed_idx = entry_id as usize;
+    if status != *FIGHTER_STATUS_KIND_ENTRY
+        && NEED_STOCK_SEED[seed_idx].swap(false, Ordering::SeqCst)
+    {
+        set_player_information(module_accessor);
     }
     // The replay camera faults if this runs on the killing blow. The other
     // fighter still reaches it before the death hook can pause sampling, so
     // Vault playback on the emulator skips it for the whole match.
     if !emulator_vault_inert() {
-        store_screen_position(module_accessor, entry_id as usize);
+        store_screen_position(module_accessor, seed_idx);
     }
     remember_emu_entry(fighter.battle_object as u64, entry_id);
-    match_feed::capture(module_accessor, entry_id as usize);
+    // Do not sample openings while stocks are still the zero default.
+    if NEED_STOCK_SEED[seed_idx].load(Ordering::SeqCst) {
+        return;
+    }
+    match_feed::capture(module_accessor, seed_idx);
 }
 
 fn install_results_poll_hook() {
@@ -270,18 +285,46 @@ unsafe extern "C" fn handle_pre_entry(fighter: &mut SmashlineFighterCommon) -> L
     EMU_STOCK_ELIMINATED.store(false, Ordering::SeqCst);
     let was_quiesced = HOOKS_QUIESCED.swap(false, Ordering::SeqCst);
     if was_quiesced {
-        for player in &GAME_INFO.players {
+        for (i, player) in GAME_INFO.players.iter().enumerate() {
             player.is_in_game.store(false, Ordering::SeqCst);
+            NEED_STOCK_SEED[i].store(false, Ordering::SeqCst);
         }
         release_fighter_hooks_for_new_match();
     }
-    let module_accessor = app::sv_system::battle_object_module_accessor(fighter.lua_state_agent);
-    set_player_information(module_accessor);
+    // Stage id is global and safe here. Do not call FighterInformation /
+    // DamageModule during Entry Pre: that runs before article setup, and
+    // 01794010404 died in sub_entry_uniq_process_init with a null article
+    // accessor right after this hook path.
     GAME_INFO
         .stage
         .store(stage_id_to_stage(stage_id()) as u32, Ordering::SeqCst);
+    let ret = original_status(Pre, fighter, *FIGHTER_STATUS_KIND_ENTRY)(fighter);
+    // Mark the slot from WorkModule only. Stocks/CPU seed on Main after Entry.
+    mark_player_entered_from_modules(fighter);
     latch_versus_on_entry();
-    original_status(Pre, fighter, *FIGHTER_STATUS_KIND_ENTRY)(fighter)
+    ret
+}
+
+/// Entry/Rebirth: record character + in-game without FighterInformation.
+/// Arms a one-shot Main-line stock seed so the live feed stays correct.
+unsafe fn mark_player_entered_from_modules(fighter: &mut SmashlineFighterCommon) {
+    let module_accessor = app::sv_system::battle_object_module_accessor(fighter.lua_state_agent);
+    let entry_id = WorkModule::get_int(module_accessor, *FIGHTER_INSTANCE_WORK_ID_INT_ENTRY_ID) as i32;
+    if entry_id < 0 {
+        return;
+    }
+    let player_num = entry_id as usize;
+    if player_num >= GAME_INFO.players.len() {
+        return;
+    }
+    let character = kind_to_char(get_kind(module_accessor)) as u32;
+    let skin = WorkModule::get_int(module_accessor, *FIGHTER_INSTANCE_WORK_ID_INT_COLOR) as u32;
+    let team = TeamModule::team_no(module_accessor) as i32;
+    GAME_INFO.players[player_num].is_in_game.store(true, Ordering::SeqCst);
+    GAME_INFO.players[player_num].character.store(character, Ordering::SeqCst);
+    GAME_INFO.players[player_num].skin.store(skin, Ordering::SeqCst);
+    GAME_INFO.players[player_num].team.store(team, Ordering::SeqCst);
+    NEED_STOCK_SEED[player_num].store(true, Ordering::SeqCst);
 }
 
 unsafe extern "C" fn handle_pre_rebirth(fighter: &mut SmashlineFighterCommon) -> L2CValue {
@@ -289,8 +332,8 @@ unsafe extern "C" fn handle_pre_rebirth(fighter: &mut SmashlineFighterCommon) ->
         // Respawn means that stock loss was not the end of the match.
         cancel_result_poll();
         EMU_STOCK_ELIMINATED.store(false, Ordering::SeqCst);
-        let module_accessor = app::sv_system::battle_object_module_accessor(fighter.lua_state_agent);
-        set_player_information(module_accessor);
+        // Same rule as Entry Pre: no FighterInformation on this line.
+        mark_player_entered_from_modules(fighter);
     }
     original_status(Pre, fighter, *FIGHTER_STATUS_KIND_REBIRTH)(fighter)
 }
@@ -318,6 +361,18 @@ pub(crate) static GAME_INFO: Info = Info::new();
 /// Set when a stock match is decided or the clock hits 0. Cleared on the next entry.
 /// While set, rebirth and death do not touch fighter modules.
 static HOOKS_QUIESCED: AtomicBool = AtomicBool::new(false);
+
+/// Entry/Rebirth arm this; Main clears it after one `set_player_information`.
+static NEED_STOCK_SEED: [AtomicBool; 8] = [
+    AtomicBool::new(false),
+    AtomicBool::new(false),
+    AtomicBool::new(false),
+    AtomicBool::new(false),
+    AtomicBool::new(false),
+    AtomicBool::new(false),
+    AtomicBool::new(false),
+    AtomicBool::new(false),
+];
 
 /// Emulator only. A death brought this fighter's tracked stocks to 0.
 /// Cleared on respawn and on the next entry. The results poll uses it
