@@ -239,9 +239,10 @@ unsafe fn sample_live_fighter(fighter: &mut SmashlineFighterCommon) {
     // so the live feed and MatchStats still see the starting stock count.
     let seed_idx = entry_id as usize;
     if status != *FIGHTER_STATUS_KIND_ENTRY
+        && !module_accessor.is_null()
         && NEED_STOCK_SEED[seed_idx].swap(false, Ordering::SeqCst)
     {
-        set_player_information(module_accessor);
+        set_player_information(&mut *module_accessor);
     }
     // The replay camera faults if this runs on the killing blow. The other
     // fighter still reaches it before the death hook can pause sampling, so
